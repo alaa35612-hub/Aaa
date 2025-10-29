@@ -8865,13 +8865,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=1,
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
+    parser.add_argument(
+        "--continuous-scan",
+        action="store_true",
+        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=float,
+        default=0.0,
+        help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
     if args.max_age_bars <= 0:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
-
-    start = time.time()
+    if args.scan_interval < 0.0:
+        parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -8943,25 +8954,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tracer.emit()
         return 0
 
-    log("Foundation")
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
-    log("Inventory")
-    log("Timeline")
-    runtime, summaries = scan_binance(
-        args.timeframe,
-        args.lookback,
-        symbols,
-        args.concurrency,
-        tracer,
-        min_daily_change=args.min_daily_change,
-        inputs=indicator_inputs,
-    )
-    perform_comparison()
-    log("Rendering")
-    render_report(runtime, args.outfile, summaries)
-    elapsed = time.time() - start
-    log(f"Coverage ({elapsed:.2f}s)")
-    tracer.emit()
+    manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
+
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            tracer.clear()
+            start = time.time()
+            if args.continuous_scan and iteration > 1:
+                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
+            log("Foundation")
+            log("Inventory")
+            log("Timeline")
+            runtime, summaries = scan_binance(
+                args.timeframe,
+                args.lookback,
+                manual_symbols,
+                args.concurrency,
+                tracer,
+                min_daily_change=args.min_daily_change,
+                inputs=indicator_inputs,
+            )
+            perform_comparison()
+            log("Rendering")
+            render_report(runtime, args.outfile, summaries)
+            elapsed = time.time() - start
+            log(f"Coverage ({elapsed:.2f}s)")
+            tracer.emit()
+            if not args.continuous_scan:
+                break
+            if args.scan_interval > 0.0:
+                print(
+                    f"انتظار {args.scan_interval:.2f} ثانية قبل تشغيل المسح التالي",
+                    flush=True,
+                )
+                time.sleep(args.scan_interval)
+    except KeyboardInterrupt:
+        print("تم إيقاف المسح من قبل المستخدم.", flush=True)
     return 0
 
 
