@@ -7253,6 +7253,51 @@ def _ticker_metric_value(ticker: Dict[str, Any], metric: str) -> Optional[float]
     return None
 
 
+def _ohlcv_metric_value(
+    candles: Sequence[Sequence[Any]],
+    metric: str,
+) -> Tuple[Optional[float], float]:
+    """Convert a slice of OHLCV rows into the requested height metric."""
+
+    if not candles:
+        return None, 0.0
+
+    first = candles[0]
+    last = candles[-1]
+
+    try:
+        first_open = float(first[1])
+    except (TypeError, ValueError):
+        first_open = math.nan
+    try:
+        last_close = float(last[4])
+    except (TypeError, ValueError):
+        last_close = math.nan
+
+    total_volume = 0.0
+    for entry in candles:
+        try:
+            vol = float(entry[5])
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(vol):
+            continue
+        total_volume += vol
+
+    if math.isnan(first_open) or math.isnan(last_close):
+        return None, total_volume
+
+    normalized = (metric or "").strip().lower()
+    if normalized == "pricechange":
+        return last_close - first_open, total_volume
+    if normalized == "lastprice":
+        return last_close, total_volume
+
+    if first_open == 0:
+        return None, total_volume
+    return ((last_close - first_open) / first_open) * 100.0, total_volume
+
+
 def _extract_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
     """Extract the quote volume used for secondary ranking."""
 
@@ -7277,6 +7322,23 @@ def _extract_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
         if not math.isnan(value):
             return value
     return None
+
+
+def _fetch_recent_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    candle_window: int,
+) -> Sequence[Sequence[Any]]:
+    """Fetch the most recent ``candle_window`` OHLC rows for ``symbol``."""
+
+    if candle_window <= 0:
+        return []
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_window)
+    except Exception as exc:
+        print(f"تعذر جلب شموع {symbol} على إطار {timeframe}: {exc}", flush=True)
+        return []
 
 
 def _binance_pick_symbols(
@@ -7350,20 +7412,32 @@ def _binance_pick_symbols(
     have_ticker_data = bool(tickers)
     have_height_requirements = (
         selector.prioritize_top_gainers
-        and have_ticker_data
         and threshold is not None
         and bool(scope)
         and candle_window is not None
     )
     used_height_filter = have_height_requirements
 
-    if selector.prioritize_top_gainers and have_ticker_data and not have_height_requirements:
+    if selector.prioritize_top_gainers and not have_height_requirements:
         print(
             "تعذر تشغيل فلتر الارتفاع: يرجى ضبط حد النسبة، الإطار الزمني، وعدد الشموع.",
             flush=True,
         )
 
     if have_height_requirements:
+        timeframe_seconds = _parse_timeframe_to_seconds(scope, None)
+        if timeframe_seconds is None:
+            print(
+                f"تعذر تفسير الإطار الزمني '{scope}' لفلتر الارتفاع؛ سيتم تجاهل التصفية.",
+                flush=True,
+            )
+            have_height_requirements = False
+            used_height_filter = False
+        elif candle_window is None:
+            have_height_requirements = False
+            used_height_filter = False
+
+    if have_height_requirements and candle_window:
         print(
             f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
             flush=True,
@@ -7372,10 +7446,12 @@ def _binance_pick_symbols(
             symbol = market.get("symbol")
             if not isinstance(symbol, str):
                 continue
-            metric_value = _ticker_metric_value(tickers.get(symbol, {}), metric)
+            candles = _fetch_recent_ohlcv(exchange, symbol, scope, candle_window)
+            metric_value, ohlcv_volume = _ohlcv_metric_value(candles[-candle_window:], metric)
             if metric_value is None or threshold is None or metric_value < threshold:
                 continue
-            volume = _extract_quote_volume(tickers.get(symbol, {})) or 0.0
+            ticker_volume = _extract_quote_volume(tickers.get(symbol, {})) or 0.0
+            volume = ticker_volume or ohlcv_volume
             prioritized.append((symbol, metric_value, volume))
         prioritized.sort(key=lambda item: (item[1], item[2]), reverse=True)
         prioritized_symbols = [symbol for symbol, _, _ in prioritized]
