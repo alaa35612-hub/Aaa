@@ -121,12 +121,14 @@ class BinanceSymbolSelectorConfig:
     # prioritisation thresholds without hunting through the scanner logic.
     # The defaults mirror the TradingView script: enable the height filter,
     # score candidates by percentage change over the selected scope, and only
-    # boost symbols that exceeded the configured threshold.
+    # boost symbols that exceeded the configured threshold across the desired
+    # number of candles.
 
     prioritize_top_gainers: bool = True
     top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
-    top_gainer_threshold: float = 5.0
-    top_gainer_scope: str = "24h"
+    top_gainer_threshold: float = 20.0
+    top_gainer_scope: str = "15m"
+    top_gainer_candle_window: int = 2
 
 
 DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
@@ -7333,6 +7335,13 @@ def _binance_pick_symbols(
     except (TypeError, ValueError):
         threshold = 0.0
     metric = selector.top_gainer_metric
+    scope = (selector.top_gainer_scope or "").strip() or "15m"
+    try:
+        candle_window = int(selector.top_gainer_candle_window)
+    except (TypeError, ValueError):
+        candle_window = 0
+    if candle_window <= 0:
+        candle_window = 1
 
     prioritized_symbols: List[str] = []
     have_ticker_data = bool(tickers)
@@ -7340,7 +7349,7 @@ def _binance_pick_symbols(
 
     if selector.prioritize_top_gainers and have_ticker_data:
         print(
-            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f}.",
+            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
             flush=True,
         )
         for market in usdtm_markets:
@@ -9751,6 +9760,16 @@ class Settings:
             self.min_change = float(threshold)
         except (TypeError, ValueError):
             self.min_change = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
+        window = kw.get(
+            "height_candle_window",
+            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
+        )
+        try:
+            self.height_candle_window = int(window)
+        except (TypeError, ValueError):
+            self.height_candle_window = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window
+        if self.height_candle_window <= 0:
+            self.height_candle_window = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window
 
 def _parse_args_android():
     import argparse
@@ -9797,6 +9816,11 @@ def _parse_args_android():
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
     p.add_argument("--min-change", type=float, default=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
+    p.add_argument(
+        "--height-candles",
+        type=int,
+        default=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
+    )
     args = p.parse_args()
 
     if args.limit <= 0:
@@ -9805,6 +9829,8 @@ def _parse_args_android():
         p.error("--max-symbols must be > 0")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
+    if args.height_candles <= 0:
+        p.error("--height-candles يجب أن يكون رقمًا موجبًا")
 
     zone_type = args.zone_type
     if args.use_mother_bar:
@@ -9854,6 +9880,7 @@ def _parse_args_android():
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
         min_change=args.min_change,
+        height_candle_window=args.height_candles,
     )
     return cfg, args
 
@@ -9880,6 +9907,11 @@ def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
         top_gainer_metric=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric,
         top_gainer_threshold=threshold,
         top_gainer_scope=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope,
+        top_gainer_candle_window=getattr(
+            cfg,
+            "height_candle_window",
+            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
+        ),
     )
 
     selection = _binance_pick_symbols(
