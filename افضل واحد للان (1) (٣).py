@@ -119,16 +119,15 @@ class BinanceSymbolSelectorConfig:
 
     # ``فلتر الارتفاع`` configuration lives here so users can adjust the
     # prioritisation thresholds without hunting through the scanner logic.
-    # The defaults mirror the TradingView script: enable the height filter,
-    # score candidates by percentage change over the selected scope, and only
-    # boost symbols that exceeded the configured threshold across the desired
-    # number of candles.
+    # Leave the numeric fields ``None`` to disable any implicit defaults—the
+    # user supplies the preferred threshold, timeframe scope, and candle
+    # window explicitly when they wish to enable the filter.
 
     prioritize_top_gainers: bool = True
     top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
-    top_gainer_threshold: float = 20.0
-    top_gainer_scope: str = "15m"
-    top_gainer_candle_window: int = 2
+    top_gainer_threshold: Optional[float] = None
+    top_gainer_scope: Optional[str] = None
+    top_gainer_candle_window: Optional[int] = None
 
 
 DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
@@ -7331,23 +7330,40 @@ def _binance_pick_symbols(
 
     prioritized: List[Tuple[str, float, float]] = []
     try:
-        threshold = float(selector.top_gainer_threshold)
+        threshold = float(selector.top_gainer_threshold) if selector.top_gainer_threshold is not None else None
     except (TypeError, ValueError):
-        threshold = 0.0
-    metric = selector.top_gainer_metric
-    scope = (selector.top_gainer_scope or "").strip() or "15m"
+        threshold = None
+    metric = (selector.top_gainer_metric or "percentage").strip() or "percentage"
+    scope = (selector.top_gainer_scope or "").strip()
     try:
-        candle_window = int(selector.top_gainer_candle_window)
+        candle_window = (
+            int(selector.top_gainer_candle_window)
+            if selector.top_gainer_candle_window is not None
+            else None
+        )
     except (TypeError, ValueError):
-        candle_window = 0
-    if candle_window <= 0:
-        candle_window = 1
+        candle_window = None
+    if candle_window is not None and candle_window <= 0:
+        candle_window = None
 
     prioritized_symbols: List[str] = []
     have_ticker_data = bool(tickers)
-    used_height_filter = selector.prioritize_top_gainers and have_ticker_data
+    have_height_requirements = (
+        selector.prioritize_top_gainers
+        and have_ticker_data
+        and threshold is not None
+        and bool(scope)
+        and candle_window is not None
+    )
+    used_height_filter = have_height_requirements
 
-    if selector.prioritize_top_gainers and have_ticker_data:
+    if selector.prioritize_top_gainers and have_ticker_data and not have_height_requirements:
+        print(
+            "تعذر تشغيل فلتر الارتفاع: يرجى ضبط حد النسبة، الإطار الزمني، وعدد الشموع.",
+            flush=True,
+        )
+
+    if have_height_requirements:
         print(
             f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
             flush=True,
@@ -7357,7 +7373,7 @@ def _binance_pick_symbols(
             if not isinstance(symbol, str):
                 continue
             metric_value = _ticker_metric_value(tickers.get(symbol, {}), metric)
-            if metric_value is None or metric_value < threshold:
+            if metric_value is None or threshold is None or metric_value < threshold:
                 continue
             volume = _extract_quote_volume(tickers.get(symbol, {})) or 0.0
             prioritized.append((symbol, metric_value, volume))
@@ -8889,7 +8905,8 @@ def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_
             if any(p in b for p in excl_patterns):
                 return False
         t = ticks.get(sym) or {}
-        if _pct_24h(t) < cfg.min_change:
+        pct_change = _pct_24h(t)
+        if cfg.min_change is not None and pct_change < cfg.min_change:
             return False
         if _qv_24h(t) < cfg.min_volume:
             return False
@@ -9755,21 +9772,22 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
-        threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
+        raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
         try:
-            self.min_change = float(threshold)
+            self.min_change = float(raw_threshold) if raw_threshold is not None else None
         except (TypeError, ValueError):
-            self.min_change = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
-        window = kw.get(
+            self.min_change = None
+        raw_window = kw.get(
             "height_candle_window",
             DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
         )
         try:
-            self.height_candle_window = int(window)
+            parsed_window = int(raw_window) if raw_window is not None else None
         except (TypeError, ValueError):
-            self.height_candle_window = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window
-        if self.height_candle_window <= 0:
-            self.height_candle_window = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window
+            parsed_window = None
+        if parsed_window is not None and parsed_window <= 0:
+            parsed_window = None
+        self.height_candle_window = parsed_window
 
 def _parse_args_android():
     import argparse
@@ -9829,7 +9847,7 @@ def _parse_args_android():
         p.error("--max-symbols must be > 0")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
-    if args.height_candles <= 0:
+    if args.height_candles is not None and args.height_candles <= 0:
         p.error("--height-candles يجب أن يكون رقمًا موجبًا")
 
     zone_type = args.zone_type
@@ -9898,12 +9916,12 @@ def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
 
     selector_threshold = getattr(cfg, "min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
     try:
-        threshold = float(selector_threshold)
+        threshold = float(selector_threshold) if selector_threshold is not None else None
     except (TypeError, ValueError):
-        threshold = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
+        threshold = None
 
     selector = BinanceSymbolSelectorConfig(
-        prioritize_top_gainers=True,
+        prioritize_top_gainers=DEFAULT_BINANCE_SYMBOL_SELECTOR.prioritize_top_gainers,
         top_gainer_metric=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric,
         top_gainer_threshold=threshold,
         top_gainer_scope=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope,
