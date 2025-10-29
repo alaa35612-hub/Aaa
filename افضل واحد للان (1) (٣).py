@@ -28,6 +28,7 @@ import datetime
 import inspect
 import json
 import math
+import os
 import re
 import sys
 import textwrap
@@ -41,6 +42,11 @@ try:
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     ccxt = None  # type: ignore
+
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    requests = None  # type: ignore
 
 
 # ----------------------------------------------------------------------------
@@ -94,6 +100,17 @@ ANSI_HEADER_COLORS = [
     "\033[93m",
     "\033[94m",
 ]
+
+
+@dataclass(frozen=True)
+class _EditorAutorunDefaults:
+    timeframe: str = "1m"
+    candle_limit: int = 600
+    max_symbols: int = 60
+    recent_bars: int = 2
+
+
+EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -8725,19 +8742,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 # Embedded Binance symbol picker + live scanner CLI (non-invasive)
 # - لا تغييرات على منطق المؤشر؛ كل شيء هنا مستقل ويستدعي الواجهات العامة فقط
 # ============================================================================
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
-import argparse, os, sys, time
-
-try:
-    import ccxt  # type: ignore
-except Exception:
-    ccxt = None  # type: ignore
-
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None  # type: ignore
 
 # ----------------------------- Filters & Helpers -----------------------------
 _MEME_BASES = {
@@ -8745,17 +8749,6 @@ _MEME_BASES = {
     "AIDOGE","MEOW","GME","TOSHI","HOPPY","KITTY","LADYS","CREAM","PIPI","JEET","CHILLGUY","HUAHUA"
 }
 _DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
-
-
-@dataclass(frozen=True)
-class _EditorAutorunDefaults:
-    timeframe: str = "1m"
-    candle_limit: int = 600
-    max_symbols: int = 60
-    recent_bars: int = 2
-
-
-EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
 
 
 def _pct_24h(t: Dict) -> float:
