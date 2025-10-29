@@ -7148,13 +7148,227 @@ class SmartMoneyAlgoProE5:
 # ----------------------------------------------------------------------------
 
 
-def fetch_binance_usdtm_symbols(exchange: Any) -> List[str]:
+@dataclass
+class BinanceSymbolSelectorConfig:
+    """User-facing switches controlling Binance symbol prioritisation."""
+
+    prioritize_top_gainers: bool = True
+    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
+    top_gainer_threshold: float = 5.0
+    top_gainer_scope: str = "24h"
+
+
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
+
+
+def _safe_symbol_metric(value: Any) -> Optional[float]:
+    """Convert metric strings such as ``"12.5%"`` into floats safely."""
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isnan(number):
+            return None
+        return number
+    if isinstance(value, str):
+        token = value.strip().rstrip("%")
+        if not token:
+            return None
+        try:
+            return float(token)
+        except ValueError:
+            return None
+    return None
+
+
+def _ticker_metric_value(ticker: Dict[str, Any], metric: str) -> Optional[float]:
+    """Pull a metric from the CCXT ticker payload regardless of vendor keys."""
+
+    if not isinstance(ticker, dict):
+        return None
+
+    normalized = (metric or "").strip().lower()
+    mapping: Dict[str, Tuple[str, ...]] = {
+        "percentage": ("percentage", "priceChangePercent", "P"),
+        "pricechange": ("change", "priceChange", "c"),
+        "lastprice": ("last", "close", "price"),
+    }
+    probe_keys = mapping.get(normalized, mapping["percentage"])
+
+    sources: List[Dict[str, Any]] = [ticker]
+    info = ticker.get("info")
+    if isinstance(info, dict):
+        sources.append(info)
+
+    for source in sources:
+        for key in probe_keys:
+            candidate = source.get(key)
+            numeric = _safe_symbol_metric(candidate)
+            if numeric is not None:
+                return numeric
+    return None
+
+
+def _extract_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
+    """Extract the quote volume used for secondary ranking."""
+
+    if not isinstance(ticker, dict):
+        return None
+
+    candidates: List[Any] = []
+    for key in ("quoteVolume", "volume", "turnover"):
+        if key in ticker:
+            candidates.append(ticker.get(key))
+    info = ticker.get("info")
+    if isinstance(info, dict):
+        for key in ("quoteVolume", "volume", "turnover"):
+            if key in info:
+                candidates.append(info.get(key))
+
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if not math.isnan(value):
+            return value
+    return None
+
+
+def _binance_pick_symbols(
+    exchange: Any,
+    limit: int,
+    explicit: Optional[str],
+    selector: BinanceSymbolSelectorConfig,
+) -> Tuple[List[str], List[str]]:
+    """Return Binance USDT-M symbols prioritised by performance metrics."""
+
+    if explicit:
+        requested = [symbol.strip().upper() for symbol in explicit.split(",") if symbol.strip()]
+        try:
+            markets = exchange.load_markets()
+        except Exception as exc:
+            print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
+            return [], []
+        valid = [symbol for symbol in requested if symbol in markets]
+        invalid = sorted(set(requested) - set(valid))
+        if invalid:
+            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid)}")
+        return valid, []
+
+    try:
+        markets = exchange.load_markets()
+    except Exception as exc:
+        print(f"فشل تحميل أسواق Binance: {exc}")
+        return [], []
+
+    usdtm_markets: List[Dict[str, Any]] = [
+        market
+        for market in markets.values()
+        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap" and market.get("active")
+    ]
+    if not usdtm_markets:
+        print("لم يتم العثور على عقود Binance USDT-M نشطة.")
+        return [], []
+
+    try:
+        tickers = exchange.fetch_tickers()
+    except Exception as exc:
+        print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
+        tickers = {}
+
+    symbol_set = {
+        market.get("symbol")
+        for market in usdtm_markets
+        if isinstance(market.get("symbol"), str)
+    }
+    tickers = {symbol: tickers.get(symbol, {}) for symbol in symbol_set}
+
+    prioritized: List[Tuple[str, float, float]] = []
+    try:
+        threshold = float(selector.top_gainer_threshold)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    metric = selector.top_gainer_metric
+
+    if selector.prioritize_top_gainers and tickers:
+        print(
+            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f}.",
+            flush=True,
+        )
+        for market in usdtm_markets:
+            symbol = market.get("symbol")
+            if not isinstance(symbol, str):
+                continue
+            metric_value = _ticker_metric_value(tickers.get(symbol, {}), metric)
+            if metric_value is None or metric_value < threshold:
+                continue
+            volume = _extract_quote_volume(tickers.get(symbol, {})) or 0.0
+            prioritized.append((symbol, metric_value, volume))
+        prioritized.sort(key=lambda item: (item[1], item[2]), reverse=True)
+
+    def volume_key(market_data: Dict[str, Any]) -> float:
+        symbol = market_data.get("symbol")
+        if not symbol:
+            return 0.0
+        vol = _extract_quote_volume(tickers.get(symbol, {}))
+        if vol is not None:
+            return vol
+        base_vol = tickers.get(symbol, {}).get("baseVolume")
+        try:
+            return float(base_vol) if base_vol is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    usdtm_by_volume = sorted(usdtm_markets, key=volume_key, reverse=True)
+
+    target_limit = limit if limit and limit > 0 else len(usdtm_by_volume)
+    final: List[str] = []
+    added: set[str] = set()
+
+    for symbol, _, _ in prioritized:
+        if len(final) >= target_limit:
+            break
+        if symbol not in added:
+            final.append(symbol)
+            added.add(symbol)
+
+    for market in usdtm_by_volume:
+        if len(final) >= target_limit:
+            break
+        symbol = market.get("symbol")
+        if symbol and symbol not in added:
+            final.append(symbol)
+            added.add(symbol)
+
+    prioritized_symbols = [symbol for symbol, _, _ in prioritized if symbol in added]
+    return final, prioritized_symbols
+
+
+def fetch_binance_usdtm_symbols(
+    exchange: Any,
+    *,
+    limit: Optional[int] = None,
+    explicit: Optional[str] = None,
+    selector: Optional[BinanceSymbolSelectorConfig] = None,
+) -> List[str]:
+    """Load Binance USDT-M symbols prioritising momentum if requested."""
+
+    selector_cfg = selector or DEFAULT_BINANCE_SYMBOL_SELECTOR
+    final, _ = _binance_pick_symbols(exchange, limit or 0, explicit, selector_cfg)
+    if final:
+        return final
+
+    # Fallback to legacy behaviour when prioritisation fails
     markets = exchange.load_markets()
-    result = []
-    for symbol, market in markets.items():
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap":
-            result.append(symbol)
-    return sorted(result)
+    symbols = [
+        symbol
+        for symbol, market in markets.items()
+        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"
+    ]
+    symbols.sort()
+    if limit and limit > 0:
+        return symbols[:limit]
+    return symbols
 
 
 def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
@@ -8211,11 +8425,16 @@ def scan_binance(
     inputs: Optional[IndicatorInputs] = None,
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
+    symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
-    all_symbols = symbols or fetch_binance_usdtm_symbols(exchange)
+    all_symbols = symbols or fetch_binance_usdtm_symbols(
+        exchange,
+        limit=max_symbols,
+        selector=symbol_selector,
+    )
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
     summaries: List[Dict[str, Any]] = []
