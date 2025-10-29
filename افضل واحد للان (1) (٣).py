@@ -9742,6 +9742,11 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
+        try:
+            self.min_change = float(threshold)
+        except (TypeError, ValueError):
+            self.min_change = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
 
 def _parse_args_android():
     import argparse
@@ -9787,6 +9792,7 @@ def _parse_args_android():
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
+    p.add_argument("--min-change", type=float, default=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
     args = p.parse_args()
 
     if args.limit <= 0:
@@ -9843,22 +9849,55 @@ def _parse_args_android():
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
+        min_change=args.min_change,
     )
     return cfg, args
 
 # ---------- Symbols universe (Futures USDT-M only) ----------
-def _pick_symbols(cfg, symbol_override:str|None, max_symbols_hint:int):
+def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
     ex = _build_exchange('usdtm')
-    markets = ex.load_markets()
-    universe = [s for s,m in markets.items() if m.get("linear") and m.get("quote")=="USDT" and m.get("type")=="swap"]
-    ban = ("INU","DOGE","PEPE","FLOKI","BONK","SHIB","BABY","CAT","MOON","MEME")
-    universe = [s for s in universe if not any(b in s for b in ban)]
-    tickers = ex.fetch_tickers()
-    ranked = sorted(universe, key=lambda s: float(tickers.get(s,{}).get("quoteVolume") or 0), reverse=True)
-    if symbol_override:
-        return [symbol_override if symbol_override in markets else symbol_override + ":USDT"]
-    k = min(int(cfg.max_scan), max_symbols_hint or len(ranked))
-    return list(dict.fromkeys(ranked[:k]))
+    explicit = (symbol_override or "").strip()
+    limit_hint = max_symbols_hint if max_symbols_hint else cfg.max_scan
+    try:
+        limit_value = int(limit_hint)
+    except (TypeError, ValueError):
+        limit_value = int(cfg.max_scan) if cfg.max_scan else 0
+    if limit_value < 0:
+        limit_value = 0
+
+    selector_threshold = getattr(cfg, "min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
+    try:
+        threshold = float(selector_threshold)
+    except (TypeError, ValueError):
+        threshold = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
+
+    selector = BinanceSymbolSelectorConfig(
+        prioritize_top_gainers=True,
+        top_gainer_metric=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric,
+        top_gainer_threshold=threshold,
+        top_gainer_scope=DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope,
+    )
+
+    selection = _binance_pick_symbols(
+        ex,
+        limit_value,
+        explicit or None,
+        selector,
+    )
+
+    symbols = selection.symbols
+    if explicit:
+        return symbols
+
+    ban = ("INU", "DOGE", "PEPE", "FLOKI", "BONK", "SHIB", "BABY", "CAT", "MOON", "MEME")
+    filtered = [s for s in symbols if not any(b in s for b in ban)]
+    if not filtered:
+        filtered = symbols
+
+    if limit_value and limit_value > 0:
+        filtered = filtered[:limit_value]
+
+    return list(dict.fromkeys(filtered))
 
 # ---------- Android CLI entry ----------
 def _android_cli_entry() -> int:
