@@ -22,6 +22,7 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import bisect
 import dataclasses
 import datetime
@@ -7324,6 +7325,84 @@ def _extract_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _binance_linear_symbol_id(symbol: str) -> Optional[str]:
+    """Translate ``BTC/USDT:USDT`` into the REST identifier ``BTCUSDT``."""
+
+    if not symbol or not isinstance(symbol, str):
+        return None
+    core = symbol.split(":", 1)[0].replace("/", "")
+    if not core.endswith("USDT"):
+        return None
+    return core
+
+
+def _bulk_fetch_recent_ohlcv(
+    exchange: Any,
+    symbols: Sequence[str],
+    timeframe: str,
+    candle_window: int,
+) -> Dict[str, Sequence[Sequence[Any]]]:
+    """Fetch OHLC candles in parallel when possible to speed up filtering."""
+
+    if candle_window <= 0:
+        return {symbol: [] for symbol in symbols}
+    unique_symbols = list(dict.fromkeys(symbols))
+    if not unique_symbols:
+        return {}
+
+    if requests is None:
+        return {
+            symbol: _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+            for symbol in unique_symbols
+        }
+
+    rest_mapping: Dict[str, Optional[str]] = {
+        symbol: _binance_linear_symbol_id(symbol) for symbol in unique_symbols
+    }
+
+    results: Dict[str, Sequence[Sequence[Any]]] = {}
+    endpoint = "https://fapi.binance.com/fapi/v1/klines"
+    max_workers = min(12, max(1, len(unique_symbols)))
+
+    def fetch(symbol: str, rest_symbol: Optional[str]) -> Sequence[Sequence[Any]]:
+        if not rest_symbol:
+            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+        params = {
+            "symbol": rest_symbol,
+            "interval": timeframe,
+            "limit": candle_window,
+        }
+        try:
+            response = requests.get(endpoint, params=params, timeout=5)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:  # pragma: no cover - network variability
+            print(
+                f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
+                flush=True,
+            )
+            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+
+        if not isinstance(payload, list):
+            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+        return payload[-candle_window:]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {
+            pool.submit(fetch, symbol, rest_mapping[symbol]): symbol
+            for symbol in unique_symbols
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                results[symbol] = future.result()
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
+                results[symbol] = _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+
+    return results
+
+
 def _fetch_recent_ohlcv(
     exchange: Any,
     symbol: str,
@@ -7442,11 +7521,17 @@ def _binance_pick_symbols(
             f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
             flush=True,
         )
+        candles_map = _bulk_fetch_recent_ohlcv(
+            exchange,
+            [market.get("symbol") for market in usdtm_markets if isinstance(market.get("symbol"), str)],
+            scope,
+            candle_window,
+        )
         for market in usdtm_markets:
             symbol = market.get("symbol")
             if not isinstance(symbol, str):
                 continue
-            candles = _fetch_recent_ohlcv(exchange, symbol, scope, candle_window)
+            candles = candles_map.get(symbol) or []
             metric_value, ohlcv_volume = _ohlcv_metric_value(candles[-candle_window:], metric)
             if metric_value is None or threshold is None or metric_value < threshold:
                 continue
