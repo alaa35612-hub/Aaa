@@ -1637,6 +1637,17 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
+            if status_key == "new":
+                alert_titles = {
+                    "IDM_OB": "IDM OB Zone Created",
+                    "EXT_OB": "EXT OB Zone Created",
+                    "GOLDEN_ZONE": "Golden Zone Created",
+                }
+                alert_title = alert_titles.get(key)
+                if alert_title:
+                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
+                    self.alertcondition(True, alert_title, message)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
