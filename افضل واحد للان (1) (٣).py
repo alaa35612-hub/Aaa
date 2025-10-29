@@ -46,8 +46,12 @@ except Exception:  # pragma: no cover - optional dependency
 
 try:
     import requests  # type: ignore
+    from requests.adapters import HTTPAdapter  # type: ignore
+    from urllib3.util.retry import Retry  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     requests = None  # type: ignore
+    HTTPAdapter = None  # type: ignore
+    Retry = None  # type: ignore
 
 
 # ----------------------------------------------------------------------------
@@ -7362,7 +7366,28 @@ def _bulk_fetch_recent_ohlcv(
 
     results: Dict[str, Sequence[Sequence[Any]]] = {}
     endpoint = "https://fapi.binance.com/fapi/v1/klines"
-    max_workers = min(12, max(1, len(unique_symbols)))
+    max_workers = min(8, max(1, len(unique_symbols)))
+    timeout = (3.05, 10.0)
+
+    session: Optional[requests.Session]
+    if HTTPAdapter is not None and Retry is not None:
+        retries = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+            raise_on_status=False,
+        )
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            max_retries=retries,
+            pool_connections=max_workers,
+            pool_maxsize=max_workers,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    else:  # pragma: no cover - requests missing adapters
+        session = requests.Session()
 
     def fetch(symbol: str, rest_symbol: Optional[str]) -> Sequence[Sequence[Any]]:
         if not rest_symbol:
@@ -7373,7 +7398,7 @@ def _bulk_fetch_recent_ohlcv(
             "limit": candle_window,
         }
         try:
-            response = requests.get(endpoint, params=params, timeout=5)
+            response = session.get(endpoint, params=params, timeout=timeout)
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:  # pragma: no cover - network variability
@@ -7387,18 +7412,23 @@ def _bulk_fetch_recent_ohlcv(
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
         return payload[-candle_window:]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_map = {
-            pool.submit(fetch, symbol, rest_mapping[symbol]): symbol
-            for symbol in unique_symbols
-        }
-        for future in concurrent.futures.as_completed(future_map):
-            symbol = future_map[future]
-            try:
-                results[symbol] = future.result()
-            except Exception as exc:  # pragma: no cover - defensive
-                print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
-                results[symbol] = _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {
+                pool.submit(fetch, symbol, rest_mapping[symbol]): symbol
+                for symbol in unique_symbols
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                symbol = future_map[future]
+                try:
+                    results[symbol] = future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
+                    results[symbol] = _fetch_recent_ohlcv(
+                        exchange, symbol, timeframe, candle_window
+                    )
+    finally:
+        session.close()
 
     return results
 
