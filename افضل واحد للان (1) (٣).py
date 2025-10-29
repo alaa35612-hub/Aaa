@@ -113,6 +113,25 @@ class _EditorAutorunDefaults:
 EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
 
 
+@dataclass(frozen=True)
+class BinanceSymbolSelectorConfig:
+    """User-facing switches controlling Binance symbol prioritisation."""
+
+    # ``فلتر الارتفاع`` configuration lives here so users can adjust the
+    # prioritisation thresholds without hunting through the scanner logic.
+    # The defaults mirror the TradingView script: enable the height filter,
+    # score candidates by percentage change over the selected scope, and only
+    # boost symbols that exceeded the configured threshold.
+
+    prioritize_top_gainers: bool = True
+    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
+    top_gainer_threshold: float = 5.0
+    top_gainer_scope: str = "24h"
+
+
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
+
+
 def _normalize_direction(value: Any) -> Optional[str]:
     if isinstance(value, str):
         token = value.strip().lower()
@@ -7163,25 +7182,6 @@ class SmartMoneyAlgoProE5:
 # ----------------------------------------------------------------------------
 # Binance scanner and report generation
 # ----------------------------------------------------------------------------
-
-
-@dataclass
-class BinanceSymbolSelectorConfig:
-    """User-facing switches controlling Binance symbol prioritisation."""
-
-    # ``فلتر الارتفاع`` configuration lives here so users can adjust the
-    # prioritisation thresholds without hunting through the scanner logic.
-    # The defaults mirror the TradingView script: enable the height filter,
-    # score candidates by percentage change over the selected scope, and only
-    # boost symbols that exceeded the configured threshold.
-
-    prioritize_top_gainers: bool = True
-    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
-    top_gainer_threshold: float = 5.0
-    top_gainer_scope: str = "24h"
-
-
-DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
 
 
 @dataclass
