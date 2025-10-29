@@ -7167,6 +7167,16 @@ class BinanceSymbolSelectorConfig:
 DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
 
 
+@dataclass
+class BinanceSymbolSelection:
+    """Container describing the outcome of Binance symbol selection."""
+
+    symbols: List[str]
+    prioritized: List[str]
+    used_height_filter: bool
+    had_prioritization_data: bool
+
+
 def _safe_symbol_metric(value: Any) -> Optional[float]:
     """Convert metric strings such as ``"12.5%"`` into floats safely."""
 
@@ -7245,7 +7255,7 @@ def _binance_pick_symbols(
     limit: int,
     explicit: Optional[str],
     selector: BinanceSymbolSelectorConfig,
-) -> Tuple[List[str], List[str]]:
+) -> BinanceSymbolSelection:
     """Return Binance USDT-M symbols prioritised by performance metrics."""
 
     if explicit:
@@ -7254,18 +7264,18 @@ def _binance_pick_symbols(
             markets = exchange.load_markets()
         except Exception as exc:
             print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
-            return [], []
+            return BinanceSymbolSelection([], [], False, False)
         valid = [symbol for symbol in requested if symbol in markets]
         invalid = sorted(set(requested) - set(valid))
         if invalid:
             print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid)}")
-        return valid, []
+        return BinanceSymbolSelection(valid, [], False, False)
 
     try:
         markets = exchange.load_markets()
     except Exception as exc:
         print(f"فشل تحميل أسواق Binance: {exc}")
-        return [], []
+        return BinanceSymbolSelection([], [], False, False)
 
     usdtm_markets: List[Dict[str, Any]] = [
         market
@@ -7274,7 +7284,7 @@ def _binance_pick_symbols(
     ]
     if not usdtm_markets:
         print("لم يتم العثور على عقود Binance USDT-M نشطة.")
-        return [], []
+        return BinanceSymbolSelection([], [], False, False)
 
     try:
         tickers = exchange.fetch_tickers()
@@ -7297,8 +7307,10 @@ def _binance_pick_symbols(
     metric = selector.top_gainer_metric
 
     prioritized_symbols: List[str] = []
+    have_ticker_data = bool(tickers)
+    used_height_filter = selector.prioritize_top_gainers and have_ticker_data
 
-    if selector.prioritize_top_gainers and tickers:
+    if selector.prioritize_top_gainers and have_ticker_data:
         print(
             f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f}.",
             flush=True,
@@ -7328,7 +7340,18 @@ def _binance_pick_symbols(
                     f"تم العثور على {len(prioritized_symbols)} رمزًا متوافقة مع حد الارتفاع وسيتم مسحها فقط.",
                     flush=True,
                 )
-            return limited_prioritized, limited_prioritized
+            return BinanceSymbolSelection(
+                limited_prioritized,
+                limited_prioritized,
+                True,
+                True,
+            )
+
+        print(
+            "لم يتم العثور على رموز تتجاوز حد فلتر الارتفاع المحدد؛ لن يتم فحص أي رموز.",
+            flush=True,
+        )
+        return BinanceSymbolSelection([], [], True, True)
 
     def volume_key(market_data: Dict[str, Any]) -> float:
         symbol = market_data.get("symbol")
@@ -7365,7 +7388,7 @@ def _binance_pick_symbols(
             added.add(symbol)
 
     prioritized_symbols = [symbol for symbol, _, _ in prioritized if symbol in added]
-    return final, prioritized_symbols
+    return BinanceSymbolSelection(final, prioritized_symbols, used_height_filter, have_ticker_data)
 
 
 def fetch_binance_usdtm_symbols(
@@ -7378,9 +7401,11 @@ def fetch_binance_usdtm_symbols(
     """Load Binance USDT-M symbols prioritising momentum if requested."""
 
     selector_cfg = selector or DEFAULT_BINANCE_SYMBOL_SELECTOR
-    final, _ = _binance_pick_symbols(exchange, limit or 0, explicit, selector_cfg)
-    if final:
-        return final
+    selection = _binance_pick_symbols(exchange, limit or 0, explicit, selector_cfg)
+    if selection.symbols:
+        return selection.symbols
+    if selection.used_height_filter and selection.had_prioritization_data:
+        return []
 
     # Fallback to legacy behaviour when prioritisation fails
     markets = exchange.load_markets()
