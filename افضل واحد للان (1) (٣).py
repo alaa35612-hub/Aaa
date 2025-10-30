@@ -22,12 +22,14 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import bisect
 import dataclasses
 import datetime
 import inspect
 import json
 import math
+import os
 import re
 import sys
 import textwrap
@@ -41,6 +43,15 @@ try:
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     ccxt = None  # type: ignore
+
+try:
+    import requests  # type: ignore
+    from requests.adapters import HTTPAdapter  # type: ignore
+    from urllib3.util.retry import Retry  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    requests = None  # type: ignore
+    HTTPAdapter = None  # type: ignore
+    Retry = None  # type: ignore
 
 
 # ----------------------------------------------------------------------------
@@ -94,6 +105,51 @@ ANSI_HEADER_COLORS = [
     "\033[93m",
     "\033[94m",
 ]
+
+
+@dataclass(frozen=True)
+class _EditorAutorunDefaults:
+    timeframe: str = "1m"
+    candle_limit: int = 600
+    max_symbols: int = 60
+    recent_bars: int = 2
+    continuous_scan: bool = False
+    scan_interval: float = 0.0
+    height_metric: str = "percentage"
+    height_scope: Optional[str] = None
+    height_threshold: Optional[float] = None
+    height_candle_window: Optional[int] = None
+
+
+# لتفعيل التشغيل المستمر افتراضيًا يمكنك تعديل المتغير التالي إلى True
+# كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
+AUTORUN_CONTINUOUS_SCAN = False
+AUTORUN_SCAN_INTERVAL = 0.0
+
+EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
+    continuous_scan=AUTORUN_CONTINUOUS_SCAN,
+    scan_interval=AUTORUN_SCAN_INTERVAL,
+)
+
+
+@dataclass(frozen=True)
+class BinanceSymbolSelectorConfig:
+    """User-facing switches controlling Binance symbol prioritisation."""
+
+    # ``فلتر الارتفاع`` configuration lives here so users can adjust the
+    # prioritisation thresholds without hunting through the scanner logic.
+    # Leave the numeric fields ``None`` to disable any implicit defaults—the
+    # user supplies the preferred threshold, timeframe scope, and candle
+    # window explicitly when they wish to enable the filter.
+
+    prioritize_top_gainers: bool = True
+    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
+    top_gainer_threshold: Optional[float] = None
+    top_gainer_scope: Optional[str] = None
+    top_gainer_candle_window: Optional[int] = None
+
+
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -1601,6 +1657,17 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
+            if status_key == "new":
+                alert_titles = {
+                    "IDM_OB": "IDM OB Zone Created",
+                    "EXT_OB": "EXT OB Zone Created",
+                    "GOLDEN_ZONE": "Golden Zone Created",
+                }
+                alert_title = alert_titles.get(key)
+                if alert_title:
+                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
+                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
+                    self.alertcondition(True, alert_title, message)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -7148,13 +7215,467 @@ class SmartMoneyAlgoProE5:
 # ----------------------------------------------------------------------------
 
 
-def fetch_binance_usdtm_symbols(exchange: Any) -> List[str]:
+@dataclass
+class BinanceSymbolSelection:
+    """Container describing the outcome of Binance symbol selection."""
+
+    symbols: List[str]
+    prioritized: List[str]
+    used_height_filter: bool
+    had_prioritization_data: bool
+
+
+def _safe_symbol_metric(value: Any) -> Optional[float]:
+    """Convert metric strings such as ``"12.5%"`` into floats safely."""
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isnan(number):
+            return None
+        return number
+    if isinstance(value, str):
+        token = value.strip().rstrip("%")
+        if not token:
+            return None
+        try:
+            return float(token)
+        except ValueError:
+            return None
+    return None
+
+
+def _ticker_metric_value(ticker: Dict[str, Any], metric: str) -> Optional[float]:
+    """Pull a metric from the CCXT ticker payload regardless of vendor keys."""
+
+    if not isinstance(ticker, dict):
+        return None
+
+    normalized = (metric or "").strip().lower()
+    mapping: Dict[str, Tuple[str, ...]] = {
+        "percentage": ("percentage", "priceChangePercent", "P"),
+        "pricechange": ("change", "priceChange", "c"),
+        "lastprice": ("last", "close", "price"),
+    }
+    probe_keys = mapping.get(normalized, mapping["percentage"])
+
+    sources: List[Dict[str, Any]] = [ticker]
+    info = ticker.get("info")
+    if isinstance(info, dict):
+        sources.append(info)
+
+    for source in sources:
+        for key in probe_keys:
+            candidate = source.get(key)
+            numeric = _safe_symbol_metric(candidate)
+            if numeric is not None:
+                return numeric
+    return None
+
+
+def _ohlcv_metric_value(
+    candles: Sequence[Sequence[Any]],
+    metric: str,
+) -> Tuple[Optional[float], float]:
+    """Convert a slice of OHLCV rows into the requested height metric."""
+
+    if not candles:
+        return None, 0.0
+
+    first = candles[0]
+    last = candles[-1]
+
+    try:
+        first_open = float(first[1])
+    except (TypeError, ValueError):
+        first_open = math.nan
+    try:
+        last_close = float(last[4])
+    except (TypeError, ValueError):
+        last_close = math.nan
+
+    total_volume = 0.0
+    for entry in candles:
+        try:
+            vol = float(entry[5])
+        except (TypeError, ValueError):
+            continue
+        if math.isnan(vol):
+            continue
+        total_volume += vol
+
+    if math.isnan(first_open) or math.isnan(last_close):
+        return None, total_volume
+
+    normalized = (metric or "").strip().lower()
+    if normalized == "pricechange":
+        return last_close - first_open, total_volume
+    if normalized == "lastprice":
+        return last_close, total_volume
+
+    if first_open == 0:
+        return None, total_volume
+    return ((last_close - first_open) / first_open) * 100.0, total_volume
+
+
+def _extract_quote_volume(ticker: Dict[str, Any]) -> Optional[float]:
+    """Extract the quote volume used for secondary ranking."""
+
+    if not isinstance(ticker, dict):
+        return None
+
+    candidates: List[Any] = []
+    for key in ("quoteVolume", "volume", "turnover"):
+        if key in ticker:
+            candidates.append(ticker.get(key))
+    info = ticker.get("info")
+    if isinstance(info, dict):
+        for key in ("quoteVolume", "volume", "turnover"):
+            if key in info:
+                candidates.append(info.get(key))
+
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if not math.isnan(value):
+            return value
+    return None
+
+
+def _binance_linear_symbol_id(symbol: str) -> Optional[str]:
+    """Translate ``BTC/USDT:USDT`` into the REST identifier ``BTCUSDT``."""
+
+    if not symbol or not isinstance(symbol, str):
+        return None
+    core = symbol.split(":", 1)[0].replace("/", "")
+    if not core.endswith("USDT"):
+        return None
+    return core
+
+
+def _bulk_fetch_recent_ohlcv(
+    exchange: Any,
+    symbols: Sequence[str],
+    timeframe: str,
+    candle_window: int,
+) -> Dict[str, Sequence[Sequence[Any]]]:
+    """Fetch OHLC candles in parallel when possible to speed up filtering."""
+
+    if candle_window <= 0:
+        return {symbol: [] for symbol in symbols}
+    unique_symbols = list(dict.fromkeys(symbols))
+    if not unique_symbols:
+        return {}
+
+    if requests is None:
+        return {
+            symbol: _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+            for symbol in unique_symbols
+        }
+
+    rest_mapping: Dict[str, Optional[str]] = {
+        symbol: _binance_linear_symbol_id(symbol) for symbol in unique_symbols
+    }
+
+    results: Dict[str, Sequence[Sequence[Any]]] = {}
+    endpoint = "https://fapi.binance.com/fapi/v1/klines"
+    max_workers = min(8, max(1, len(unique_symbols)))
+    timeout = (3.05, 10.0)
+
+    session: Optional[requests.Session]
+    if HTTPAdapter is not None and Retry is not None:
+        retries = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=("GET",),
+            raise_on_status=False,
+        )
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            max_retries=retries,
+            pool_connections=max_workers,
+            pool_maxsize=max_workers,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    else:  # pragma: no cover - requests missing adapters
+        session = requests.Session()
+
+    def fetch(symbol: str, rest_symbol: Optional[str]) -> Sequence[Sequence[Any]]:
+        if not rest_symbol:
+            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+        params = {
+            "symbol": rest_symbol,
+            "interval": timeframe,
+            "limit": candle_window,
+        }
+        try:
+            response = session.get(endpoint, params=params, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:  # pragma: no cover - network variability
+            print(
+                f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
+                flush=True,
+            )
+            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+
+        if not isinstance(payload, list):
+            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+        return payload[-candle_window:]
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {
+                pool.submit(fetch, symbol, rest_mapping[symbol]): symbol
+                for symbol in unique_symbols
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                symbol = future_map[future]
+                try:
+                    results[symbol] = future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
+                    results[symbol] = _fetch_recent_ohlcv(
+                        exchange, symbol, timeframe, candle_window
+                    )
+    finally:
+        session.close()
+
+    return results
+
+
+def _fetch_recent_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    candle_window: int,
+) -> Sequence[Sequence[Any]]:
+    """Fetch the most recent ``candle_window`` OHLC rows for ``symbol``."""
+
+    if candle_window <= 0:
+        return []
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_window)
+    except Exception as exc:
+        print(f"تعذر جلب شموع {symbol} على إطار {timeframe}: {exc}", flush=True)
+        return []
+
+
+def _binance_pick_symbols(
+    exchange: Any,
+    limit: int,
+    explicit: Optional[str],
+    selector: BinanceSymbolSelectorConfig,
+) -> BinanceSymbolSelection:
+    """Return Binance USDT-M symbols prioritised by performance metrics."""
+
+    if explicit:
+        requested = [symbol.strip().upper() for symbol in explicit.split(",") if symbol.strip()]
+        try:
+            markets = exchange.load_markets()
+        except Exception as exc:
+            print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
+            return BinanceSymbolSelection([], [], False, False)
+        valid = [symbol for symbol in requested if symbol in markets]
+        invalid = sorted(set(requested) - set(valid))
+        if invalid:
+            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid)}")
+        return BinanceSymbolSelection(valid, [], False, False)
+
+    try:
+        markets = exchange.load_markets()
+    except Exception as exc:
+        print(f"فشل تحميل أسواق Binance: {exc}")
+        return BinanceSymbolSelection([], [], False, False)
+
+    usdtm_markets: List[Dict[str, Any]] = [
+        market
+        for market in markets.values()
+        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap" and market.get("active")
+    ]
+    if not usdtm_markets:
+        print("لم يتم العثور على عقود Binance USDT-M نشطة.")
+        return BinanceSymbolSelection([], [], False, False)
+
+    try:
+        tickers = exchange.fetch_tickers()
+    except Exception as exc:
+        print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
+        tickers = {}
+
+    symbol_set = {
+        market.get("symbol")
+        for market in usdtm_markets
+        if isinstance(market.get("symbol"), str)
+    }
+    tickers = {symbol: tickers.get(symbol, {}) for symbol in symbol_set}
+
+    prioritized: List[Tuple[str, float, float]] = []
+    try:
+        threshold = float(selector.top_gainer_threshold) if selector.top_gainer_threshold is not None else None
+    except (TypeError, ValueError):
+        threshold = None
+    metric = (selector.top_gainer_metric or "percentage").strip() or "percentage"
+    scope = (selector.top_gainer_scope or "").strip()
+    try:
+        candle_window = (
+            int(selector.top_gainer_candle_window)
+            if selector.top_gainer_candle_window is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        candle_window = None
+    if candle_window is not None and candle_window <= 0:
+        candle_window = None
+
+    prioritized_symbols: List[str] = []
+    have_ticker_data = bool(tickers)
+    have_height_requirements = (
+        selector.prioritize_top_gainers
+        and threshold is not None
+        and bool(scope)
+        and candle_window is not None
+    )
+    used_height_filter = have_height_requirements
+
+    if selector.prioritize_top_gainers and not have_height_requirements:
+        print(
+            "تعذر تشغيل فلتر الارتفاع: يرجى ضبط حد النسبة، الإطار الزمني، وعدد الشموع.",
+            flush=True,
+        )
+
+    if have_height_requirements:
+        timeframe_seconds = _parse_timeframe_to_seconds(scope, None)
+        if timeframe_seconds is None:
+            print(
+                f"تعذر تفسير الإطار الزمني '{scope}' لفلتر الارتفاع؛ سيتم تجاهل التصفية.",
+                flush=True,
+            )
+            have_height_requirements = False
+            used_height_filter = False
+        elif candle_window is None:
+            have_height_requirements = False
+            used_height_filter = False
+
+    if have_height_requirements and candle_window:
+        print(
+            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
+            flush=True,
+        )
+        candles_map = _bulk_fetch_recent_ohlcv(
+            exchange,
+            [market.get("symbol") for market in usdtm_markets if isinstance(market.get("symbol"), str)],
+            scope,
+            candle_window,
+        )
+        for market in usdtm_markets:
+            symbol = market.get("symbol")
+            if not isinstance(symbol, str):
+                continue
+            candles = candles_map.get(symbol) or []
+            metric_value, ohlcv_volume = _ohlcv_metric_value(candles[-candle_window:], metric)
+            if metric_value is None or threshold is None or metric_value < threshold:
+                continue
+            ticker_volume = _extract_quote_volume(tickers.get(symbol, {})) or 0.0
+            volume = ticker_volume or ohlcv_volume
+            prioritized.append((symbol, metric_value, volume))
+        prioritized.sort(key=lambda item: (item[1], item[2]), reverse=True)
+        prioritized_symbols = [symbol for symbol, _, _ in prioritized]
+
+        if prioritized_symbols:
+            target_limit = limit if limit and limit > 0 else len(prioritized_symbols)
+            limited_prioritized = prioritized_symbols[:target_limit]
+            if len(limited_prioritized) < len(prioritized_symbols):
+                print(
+                    f"تم العثور على {len(prioritized_symbols)} رمزًا تجاوزت حد الارتفاع؛ سيتم مسح أول {len(limited_prioritized)} فقط.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"تم العثور على {len(prioritized_symbols)} رمزًا متوافقة مع حد الارتفاع وسيتم مسحها فقط.",
+                    flush=True,
+                )
+            return BinanceSymbolSelection(
+                limited_prioritized,
+                limited_prioritized,
+                True,
+                True,
+            )
+
+        print(
+            "لم يتم العثور على رموز تتجاوز حد فلتر الارتفاع المحدد؛ لن يتم فحص أي رموز.",
+            flush=True,
+        )
+        return BinanceSymbolSelection([], [], True, True)
+
+    def volume_key(market_data: Dict[str, Any]) -> float:
+        symbol = market_data.get("symbol")
+        if not symbol:
+            return 0.0
+        vol = _extract_quote_volume(tickers.get(symbol, {}))
+        if vol is not None:
+            return vol
+        base_vol = tickers.get(symbol, {}).get("baseVolume")
+        try:
+            return float(base_vol) if base_vol is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    usdtm_by_volume = sorted(usdtm_markets, key=volume_key, reverse=True)
+
+    target_limit = limit if limit and limit > 0 else len(usdtm_by_volume)
+    final: List[str] = []
+    added: set[str] = set()
+
+    for symbol, _, _ in prioritized:
+        if len(final) >= target_limit:
+            break
+        if symbol not in added:
+            final.append(symbol)
+            added.add(symbol)
+
+    for market in usdtm_by_volume:
+        if len(final) >= target_limit:
+            break
+        symbol = market.get("symbol")
+        if symbol and symbol not in added:
+            final.append(symbol)
+            added.add(symbol)
+
+    prioritized_symbols = [symbol for symbol, _, _ in prioritized if symbol in added]
+    return BinanceSymbolSelection(final, prioritized_symbols, used_height_filter, have_ticker_data)
+
+
+def fetch_binance_usdtm_symbols(
+    exchange: Any,
+    *,
+    limit: Optional[int] = None,
+    explicit: Optional[str] = None,
+    selector: Optional[BinanceSymbolSelectorConfig] = None,
+) -> List[str]:
+    """Load Binance USDT-M symbols prioritising momentum if requested."""
+
+    selector_cfg = selector or DEFAULT_BINANCE_SYMBOL_SELECTOR
+    selection = _binance_pick_symbols(exchange, limit or 0, explicit, selector_cfg)
+    if selection.symbols:
+        return selection.symbols
+    if selection.used_height_filter and selection.had_prioritization_data:
+        return []
+
+    # Fallback to legacy behaviour when prioritisation fails
     markets = exchange.load_markets()
-    result = []
-    for symbol, market in markets.items():
-        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap":
-            result.append(symbol)
-    return sorted(result)
+    symbols = [
+        symbol
+        for symbol, market in markets.items()
+        if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"
+    ]
+    symbols.sort()
+    if limit and limit > 0:
+        return symbols[:limit]
+    return symbols
 
 
 def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
@@ -8211,11 +8732,16 @@ def scan_binance(
     inputs: Optional[IndicatorInputs] = None,
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
+    symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
-    all_symbols = symbols or fetch_binance_usdtm_symbols(exchange)
+    all_symbols = symbols or fetch_binance_usdtm_symbols(
+        exchange,
+        limit=max_symbols,
+        selector=symbol_selector,
+    )
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
     summaries: List[Dict[str, Any]] = []
@@ -8353,13 +8879,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=1,
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
+    parser.add_argument(
+        "--continuous",
+        "--continuous-scan",
+        dest="continuous_scan",
+        action=_OptionalBoolAction,
+        default=False,
+        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف (يدعم true/false)",
+    )
+    parser.add_argument(
+        "--no-continuous",
+        "--no-continuous-scan",
+        dest="continuous_scan",
+        action="store_false",
+        help="تعطيل حلقة المسح المستمرة",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=float,
+        default=0.0,
+        help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous-scan",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
     if args.max_age_bars <= 0:
         parser.error("--max-age-bars يجب أن يكون رقمًا موجبًا")
-
-    start = time.time()
+    if args.scan_interval < 0.0:
+        parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
 
     def log(stage: str) -> None:
         print(stage, flush=True)
@@ -8431,25 +8978,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tracer.emit()
         return 0
 
-    log("Foundation")
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
-    log("Inventory")
-    log("Timeline")
-    runtime, summaries = scan_binance(
-        args.timeframe,
-        args.lookback,
-        symbols,
-        args.concurrency,
-        tracer,
-        min_daily_change=args.min_daily_change,
-        inputs=indicator_inputs,
-    )
-    perform_comparison()
-    log("Rendering")
-    render_report(runtime, args.outfile, summaries)
-    elapsed = time.time() - start
-    log(f"Coverage ({elapsed:.2f}s)")
-    tracer.emit()
+    manual_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] or None
+
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            tracer.clear()
+            start = time.time()
+            if args.continuous_scan and iteration > 1:
+                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
+            log("Foundation")
+            log("Inventory")
+            log("Timeline")
+            runtime, summaries = scan_binance(
+                args.timeframe,
+                args.lookback,
+                manual_symbols,
+                args.concurrency,
+                tracer,
+                min_daily_change=args.min_daily_change,
+                inputs=indicator_inputs,
+            )
+            perform_comparison()
+            log("Rendering")
+            render_report(runtime, args.outfile, summaries)
+            elapsed = time.time() - start
+            log(f"Coverage ({elapsed:.2f}s)")
+            tracer.emit()
+            if not args.continuous_scan:
+                print(
+                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
+                    " لتفعيل الحلقة استخدم --continuous-scan=true أو فعّل المتغير"
+                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
+                    flush=True,
+                )
+                break
+            if args.scan_interval > 0.0:
+                print(
+                    f"انتظار {args.scan_interval:.2f} ثانية قبل تشغيل المسح التالي",
+                    flush=True,
+                )
+                time.sleep(args.scan_interval)
+    except KeyboardInterrupt:
+        print("تم إيقاف المسح من قبل المستخدم.", flush=True)
     return 0
 
 
@@ -8457,19 +9029,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 # Embedded Binance symbol picker + live scanner CLI (non-invasive)
 # - لا تغييرات على منطق المؤشر؛ كل شيء هنا مستقل ويستدعي الواجهات العامة فقط
 # ============================================================================
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
-import argparse, os, sys, time
-
-try:
-    import ccxt  # type: ignore
-except Exception:
-    ccxt = None  # type: ignore
-
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None  # type: ignore
 
 # ----------------------------- Filters & Helpers -----------------------------
 _MEME_BASES = {
@@ -8477,17 +9036,6 @@ _MEME_BASES = {
     "AIDOGE","MEOW","GME","TOSHI","HOPPY","KITTY","LADYS","CREAM","PIPI","JEET","CHILLGUY","HUAHUA"
 }
 _DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
-
-
-@dataclass(frozen=True)
-class _EditorAutorunDefaults:
-    timeframe: str = "1m"
-    candle_limit: int = 600
-    max_symbols: int = 60
-    recent_bars: int = 2
-
-
-EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
 
 
 def _pct_24h(t: Dict) -> float:
@@ -8519,6 +9067,36 @@ def _normalize_list(csv_like: str) -> List[str]:
     if not csv_like:
         return []
     return [x.strip().upper() for x in csv_like.split(",") if x.strip()]
+
+
+def _parse_bool_token(token: str) -> bool:
+    normalized = token.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y", "enable", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n", "disable", "disabled"}:
+        return False
+    raise ValueError(f"قيمة منطقية غير صالحة: {token!r}")
+
+
+class _OptionalBoolAction(argparse.Action):
+    """argparse action allowing ``--flag`` or ``--flag=false`` patterns."""
+
+    def __init__(self, option_strings, dest, **kwargs):  # type: ignore[override]
+        if "nargs" in kwargs:
+            raise ValueError("_OptionalBoolAction لا يدعم تحديد nargs")
+        kwargs.setdefault("default", False)
+        super().__init__(option_strings, dest, nargs="?", **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
+        if values is None:
+            setattr(namespace, self.dest, True)
+            return
+        try:
+            parsed = _parse_bool_token(str(values))
+        except ValueError as exc:
+            parser.error(str(exc))
+        setattr(namespace, self.dest, parsed)
+
 
 # ----------------------------- CLI Settings ----------------------------------
 @dataclass
@@ -8608,7 +9186,8 @@ def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_
             if any(p in b for p in excl_patterns):
                 return False
         t = ticks.get(sym) or {}
-        if _pct_24h(t) < cfg.min_change:
+        pct_change = _pct_24h(t)
+        if cfg.min_change is not None and pct_change < cfg.min_change:
             return False
         if _qv_24h(t) < cfg.min_volume:
             return False
@@ -9066,106 +9645,6 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
 
 
 
-def _android_cli_entry() -> int:
-    # Android CLI entry: futures-only live scan with Arabic renderer
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-
-    # Build symbols first with strong filters
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-
-    # Core indicator types must exist in the merged file
-    try:
-        SmartMoneyAlgoProE5
-        IndicatorInputs
-        PullbackInputs
-        MarketStructureInputs
-        OrderFlowInputs
-        FVGInputs
-        LiquidityInputs
-        DemandSupplyInputs
-        OrderBlockInputs
-        StructureInputs
-        ICTMarketStructureInputs
-        fetch_ohlcv
-    except NameError as e:
-        print("Missing core symbol in indicator:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
-    ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
-
-    inputs = IndicatorInputs(
-        pullback=pullback,
-        structure=structure,
-        order_flow=order_flow,
-        fvg=fvg,
-        liquidity=liq,
-        demand_supply=ds,
-        order_block=ob,
-        structure_util=utils,
-        ict_structure=ict,
-    )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
-
-    ex = _build_exchange(cfg.market)
-    alerts_total = 0
-    symbols = symbols[:int(cfg.max_scan)]
-
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process(candles)
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
-            )
-            continue
-
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            try:
-                cutoff_time = runtime.series.get_time(cutoff_idx)
-                recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-            except Exception:
-                pass
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
-    return 0
-
 def __router_main__():
     import sys
     # Try to use embedded CLI when available
@@ -9474,6 +9953,54 @@ class Settings:
         self.structure_requires_wick = kw.get("structure_requires_wick", False)
         self.mtf_lookahead = kw.get("mtf_lookahead", False)
         self.zone_type = kw.get("zone_type", "Mother Bar")
+        raw_threshold = kw.get("min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
+        try:
+            self.min_change = float(raw_threshold) if raw_threshold is not None else None
+        except (TypeError, ValueError):
+            self.min_change = None
+        raw_window = kw.get(
+            "height_candle_window",
+            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
+        )
+        try:
+            parsed_window = int(raw_window) if raw_window is not None else None
+        except (TypeError, ValueError):
+            parsed_window = None
+        if parsed_window is not None and parsed_window <= 0:
+            parsed_window = None
+        self.height_candle_window = parsed_window
+        raw_metric = kw.get("height_metric", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric)
+        if isinstance(raw_metric, str):
+            metric_value = raw_metric.strip() or DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
+        elif raw_metric is None:
+            metric_value = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
+        else:
+            metric_value = str(raw_metric)
+        self.height_metric = metric_value
+        scope_value = kw.get("height_scope", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope)
+        if isinstance(scope_value, str):
+            stripped_scope = scope_value.strip()
+            self.height_scope = stripped_scope or None
+        else:
+            self.height_scope = None
+        raw_continuous = kw.get("continuous_scan", EDITOR_AUTORUN_DEFAULTS.continuous_scan)
+        if isinstance(raw_continuous, str):
+            normalized = raw_continuous.strip().lower()
+            if normalized in ("", "0", "false", "no", "off"):
+                continuous_value = False
+            elif normalized in ("1", "true", "yes", "on"):
+                continuous_value = True
+            else:
+                continuous_value = EDITOR_AUTORUN_DEFAULTS.continuous_scan
+        else:
+            continuous_value = bool(raw_continuous)
+        self.continuous_scan = continuous_value
+        raw_interval = kw.get("continuous_interval", EDITOR_AUTORUN_DEFAULTS.scan_interval)
+        try:
+            parsed_interval = float(raw_interval)
+        except (TypeError, ValueError):
+            parsed_interval = EDITOR_AUTORUN_DEFAULTS.scan_interval
+        self.continuous_interval = parsed_interval if parsed_interval >= 0 else 0.0
 
 def _parse_args_android():
     import argparse
@@ -9519,6 +10046,65 @@ def _parse_args_android():
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
+    default_threshold = (
+        EDITOR_AUTORUN_DEFAULTS.height_threshold
+        if EDITOR_AUTORUN_DEFAULTS.height_threshold is not None
+        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold
+    )
+    p.add_argument("--min-change", type=float, default=default_threshold)
+    default_candle_window = (
+        EDITOR_AUTORUN_DEFAULTS.height_candle_window
+        if EDITOR_AUTORUN_DEFAULTS.height_candle_window is not None
+        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window
+    )
+    p.add_argument(
+        "--height-candles",
+        type=int,
+        default=default_candle_window,
+    )
+    default_scope = (
+        EDITOR_AUTORUN_DEFAULTS.height_scope
+        if EDITOR_AUTORUN_DEFAULTS.height_scope is not None
+        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope
+    )
+    default_metric = (
+        EDITOR_AUTORUN_DEFAULTS.height_metric
+        if EDITOR_AUTORUN_DEFAULTS.height_metric is not None
+        else DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
+    )
+    p.add_argument(
+        "--height-scope",
+        type=str,
+        default=default_scope or "",
+        help="الإطار الزمني الذي يستخدمه فلتر نسبة الارتفاع (مثال: 1m)",
+    )
+    p.add_argument(
+        "--height-metric",
+        type=str,
+        default=default_metric,
+        help="المقياس المستخدم لترتيب الرابحين {percentage, pricechange, lastprice}",
+    )
+    p.add_argument(
+        "--continuous",
+        "--continuous-scan",
+        dest="continuous",
+        action=_OptionalBoolAction,
+        default=EDITOR_AUTORUN_DEFAULTS.continuous_scan,
+        help="تشغيل المسح بشكل مستمر بدون توقف (يدعم true/false)",
+    )
+    p.add_argument(
+        "--no-continuous",
+        "--no-continuous-scan",
+        dest="continuous",
+        action="store_false",
+        help="تعطيل المسح المستمر (عند وجود --continuous في الإعدادات)",
+    )
+    p.add_argument(
+        "--continuous-interval",
+        type=float,
+        default=EDITOR_AUTORUN_DEFAULTS.scan_interval,
+        help="عدد الثواني للانتظار قبل إعادة تشغيل المسح عند تفعيل --continuous",
+    )
     args = p.parse_args()
 
     if args.limit <= 0:
@@ -9527,6 +10113,10 @@ def _parse_args_android():
         p.error("--max-symbols must be > 0")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
+    if args.height_candles is not None and args.height_candles <= 0:
+        p.error("--height-candles يجب أن يكون رقمًا موجبًا")
+    if args.continuous_interval < 0:
+        p.error("--continuous-interval يجب أن يكون رقمًا غير سالب")
 
     zone_type = args.zone_type
     if args.use_mother_bar:
@@ -9535,6 +10125,15 @@ def _parse_args_android():
         zone_type = "---"
     if zone_type is None:
         zone_type = "Mother Bar"
+
+    height_scope = None
+    if isinstance(args.height_scope, str):
+        stripped_scope = args.height_scope.strip()
+        height_scope = stripped_scope or None
+
+    height_metric = args.height_metric.strip() if isinstance(args.height_metric, str) else ""
+    if not height_metric:
+        height_metric = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
 
     cfg = Settings(
         eps=args.eps,
@@ -9575,22 +10174,77 @@ def _parse_args_android():
         zone_type=zone_type,
         drop_last_incomplete=args.drop_last,
         max_scan=args.max_symbols,
+        min_change=args.min_change,
+        height_candle_window=args.height_candles,
+        height_scope=height_scope,
+        height_metric=height_metric,
+        continuous_scan=args.continuous,
+        continuous_interval=args.continuous_interval,
     )
     return cfg, args
 
 # ---------- Symbols universe (Futures USDT-M only) ----------
-def _pick_symbols(cfg, symbol_override:str|None, max_symbols_hint:int):
+def _pick_symbols(cfg, symbol_override: str | None, max_symbols_hint: int):
     ex = _build_exchange('usdtm')
-    markets = ex.load_markets()
-    universe = [s for s,m in markets.items() if m.get("linear") and m.get("quote")=="USDT" and m.get("type")=="swap"]
-    ban = ("INU","DOGE","PEPE","FLOKI","BONK","SHIB","BABY","CAT","MOON","MEME")
-    universe = [s for s in universe if not any(b in s for b in ban)]
-    tickers = ex.fetch_tickers()
-    ranked = sorted(universe, key=lambda s: float(tickers.get(s,{}).get("quoteVolume") or 0), reverse=True)
-    if symbol_override:
-        return [symbol_override if symbol_override in markets else symbol_override + ":USDT"]
-    k = min(int(cfg.max_scan), max_symbols_hint or len(ranked))
-    return list(dict.fromkeys(ranked[:k]))
+    explicit = (symbol_override or "").strip()
+    limit_hint = max_symbols_hint if max_symbols_hint else cfg.max_scan
+    try:
+        limit_value = int(limit_hint)
+    except (TypeError, ValueError):
+        limit_value = int(cfg.max_scan) if cfg.max_scan else 0
+    if limit_value < 0:
+        limit_value = 0
+
+    selector_threshold = getattr(cfg, "min_change", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_threshold)
+    try:
+        threshold = float(selector_threshold) if selector_threshold is not None else None
+    except (TypeError, ValueError):
+        threshold = None
+    raw_metric = getattr(cfg, "height_metric", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric)
+    if isinstance(raw_metric, str):
+        metric = raw_metric.strip() or DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
+    elif raw_metric is None:
+        metric = DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_metric
+    else:
+        metric = str(raw_metric)
+    raw_scope = getattr(cfg, "height_scope", DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_scope)
+    if isinstance(raw_scope, str):
+        scope = raw_scope.strip()
+    else:
+        scope = None
+
+    selector = BinanceSymbolSelectorConfig(
+        prioritize_top_gainers=DEFAULT_BINANCE_SYMBOL_SELECTOR.prioritize_top_gainers,
+        top_gainer_metric=metric,
+        top_gainer_threshold=threshold,
+        top_gainer_scope=scope,
+        top_gainer_candle_window=getattr(
+            cfg,
+            "height_candle_window",
+            DEFAULT_BINANCE_SYMBOL_SELECTOR.top_gainer_candle_window,
+        ),
+    )
+
+    selection = _binance_pick_symbols(
+        ex,
+        limit_value,
+        explicit or None,
+        selector,
+    )
+
+    symbols = selection.symbols
+    if explicit:
+        return symbols
+
+    ban = ("INU", "DOGE", "PEPE", "FLOKI", "BONK", "SHIB", "BABY", "CAT", "MOON", "MEME")
+    filtered = [s for s in symbols if not any(b in s for b in ban)]
+    if not filtered:
+        filtered = symbols
+
+    if limit_value and limit_value > 0:
+        filtered = filtered[:limit_value]
+
+    return list(dict.fromkeys(filtered))
 
 # ---------- Android CLI entry ----------
 def _android_cli_entry() -> int:
@@ -9600,9 +10254,7 @@ def _android_cli_entry() -> int:
     cfg, args = _parse_args_android()
     recent_window = max(1, args.recent)
 
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-    symbols = list(dict.fromkeys(symbols))
-    ex = _build_exchange('usdtm')
+    ex = _build_exchange(getattr(cfg, "market", 'usdtm'))
 
     try:
         SmartMoneyAlgoProE5
@@ -9616,6 +10268,7 @@ def _android_cli_entry() -> int:
         OrderBlockInputs
         StructureInputs
         ICTMarketStructureInputs
+        fetch_ohlcv
     except NameError as e:
         print("Missing indicator class or inputs:", e, file=sys.stderr)
         return 3
@@ -9627,7 +10280,7 @@ def _android_cli_entry() -> int:
     liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
     ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
     ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=True, markX=cfg.show_mark_x)
+    utils = StructureInputs(isOTE=cfg.show_ote, markX=cfg.show_mark_x)
     ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
 
     inputs = IndicatorInputs(
@@ -9637,56 +10290,94 @@ def _android_cli_entry() -> int:
     )
     inputs.console.max_age_bars = max(1, recent_window - 1)
 
-    alerts_total = 0
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process([{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')} for c in candles])
-        except Exception as e:
-            print(
-                f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                file=sys.stderr,
-            )
-            continue
+    symbol_override = args.symbol or None
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            if cfg.continuous_scan and iteration > 1:
+                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
 
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=recent_window
-        )
-        if not recent_hits:
-            if recent_window == 1:
-                span_phrase = "آخر شمعة واحدة"
-            elif recent_window == 2:
-                span_phrase = "آخر شمعتين"
-            else:
-                span_phrase = f"آخر {recent_window} شموع"
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-            )
-            continue
+            symbols = _pick_symbols(cfg, symbol_override=symbol_override, max_symbols_hint=args.max_symbols)
+            symbols = list(dict.fromkeys(symbols))
+            if cfg.max_scan:
+                try:
+                    symbols = symbols[: int(cfg.max_scan)]
+                except Exception:
+                    pass
+            alerts_total = 0
 
-        recent_alerts = list(getattr(runtime, "alerts", []))
-        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-            try:
-                cutoff_idx = max(0, runtime.series.length() - recent_window)
-                cutoff_time = runtime.series.get_time(cutoff_idx)
-                if cutoff_time:
-                    recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-            except Exception:
-                pass
+            for i, sym in enumerate(symbols, 1):
+                try:
+                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
+                    if cfg.drop_last_incomplete and candles:
+                        candles = candles[:-1]
+                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+                    runtime._bos_break_source = cfg.bos_confirmation
+                    runtime._strict_close_for_break = cfg.strict_close_for_break
+                    runtime.process([
+                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
+                        for c in candles
+                    ])
+                except Exception as e:
+                    print(
+                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
+                        file=sys.stderr,
+                    )
+                    continue
 
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            alerts_total += len(recent_alerts)
+                metrics = runtime.gather_console_metrics()
+                latest_events = metrics.get("latest_events") or {}
+                recent_hits, _ = _collect_recent_event_hits(
+                    runtime.series, latest_events, bars=recent_window
+                )
+                if not recent_hits:
+                    if recent_window == 1:
+                        span_phrase = "آخر شمعة واحدة"
+                    elif recent_window == 2:
+                        span_phrase = "آخر شمعتين"
+                    else:
+                        span_phrase = f"آخر {recent_window} شموع"
+                    print(
+                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
+                    )
+                    continue
 
-    if args.verbose:
-        print(f"\\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
+                recent_alerts = list(getattr(runtime, "alerts", []))
+                if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+                    try:
+                        cutoff_idx = max(0, runtime.series.length() - recent_window)
+                        cutoff_time = runtime.series.get_time(cutoff_idx)
+                        if cutoff_time:
+                            recent_alerts = [
+                                (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
+                            ]
+                    except Exception:
+                        pass
+
+                if recent_alerts or args.verbose:
+                    _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
+                    alerts_total += len(recent_alerts)
+
+            if args.verbose:
+                print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
+
+            if not cfg.continuous_scan:
+                print(
+                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
+                    " لتشغيل المسح باستمرار استخدم --continuous=true أو عدّل"
+                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
+                    flush=True,
+                )
+                break
+            if cfg.continuous_interval > 0:
+                print(
+                    f"انتظار {cfg.continuous_interval:.2f} ثانية قبل تشغيل المسح التالي",
+                    flush=True,
+                )
+                time.sleep(cfg.continuous_interval)
+    except KeyboardInterrupt:
+        print("تم إيقاف المسح من قبل المستخدم.")
     return 0
 
 # ---------- Router ----------
@@ -9700,6 +10391,18 @@ def __router_main__():
             "--recent", str(defaults.recent_bars),
             "--verbose",
         ]
+        if defaults.height_threshold is not None:
+            sys.argv += ["--min-change", str(defaults.height_threshold)]
+        if defaults.height_candle_window is not None:
+            sys.argv += ["--height-candles", str(defaults.height_candle_window)]
+        if defaults.height_scope:
+            sys.argv += ["--height-scope", str(defaults.height_scope)]
+        if defaults.height_metric:
+            sys.argv += ["--height-metric", str(defaults.height_metric)]
+        if defaults.continuous_scan:
+            sys.argv.append("--continuous")
+        if defaults.scan_interval > 0:
+            sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
     return _android_cli_entry()
 
 # ---------- Main ----------
