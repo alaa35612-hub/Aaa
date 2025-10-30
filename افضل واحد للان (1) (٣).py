@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import copy
 import dataclasses
 import datetime
 import inspect
@@ -94,6 +95,43 @@ ANSI_HEADER_COLORS = [
     "\033[93m",
     "\033[94m",
 ]
+
+
+ICT_STRATEGY_RULES: Dict[str, Any] = {
+    "strategy": {
+        "name": "ICT Multi-Timeframe Sweep OTE",
+        "higher_timeframe": "15m",
+        "lower_timeframe": "1m",
+        "entry_rules": {
+            "long_setup": {
+                "htf_trend": "Bullish BOS on 15m (uptrend structure confirmed)",
+                "ltf_conditions": [
+                    "Sell-side liquidity sweep on 1m (price sweeps a prior low then rebounds)",
+                    "Retracement into a bullish FVG or demand OB within OTE zone (62%-79% retracement)",
+                ],
+            },
+            "short_setup": {
+                "htf_trend": "Bearish BOS أو CHOCH على 15m (هيكل هابط)",
+                "ltf_conditions": [
+                    "Buy-side liquidity sweep on 1m (price sweeps a prior high then reverses)",
+                    "Retracement into a bearish FVG or supply OB within OTE zone (62%-79% retracement)",
+                ],
+            },
+        },
+    },
+    "risk_management": {
+        "risk_per_trade": 0.02,
+        "initial_account_size": 100,
+    },
+    "focus_sessions": ["London", "New York", "Asia"],
+    "runtime": {
+        "htf_timeframe": "15m",
+        "ltf_timeframe": "1m",
+        "htf_lookback": 400,
+        "ltf_lookback": 1200,
+        "ote_ratio": (0.62, 0.79),
+    },
+}
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -1623,14 +1661,29 @@ class SmartMoneyAlgoProE5:
                 if not self._console_event_within_age(lbl.x):
                     continue
                 if predicate(lbl):
-                    display = formatter(lbl) if formatter else f"{lbl.text} @ {format_price(lbl.y)}"
-                    events[key] = {
+                    default_display = f"{lbl.text} @ {format_price(lbl.y)}"
+                    extra: Dict[str, Any] = {}
+                    display_value: Optional[str] = None
+                    if formatter:
+                        formatted = formatter(lbl)
+                        if isinstance(formatted, dict):
+                            display_value = formatted.get("display")
+                            extra = {k: v for k, v in formatted.items() if k != "display"}
+                        elif formatted is not None:
+                            display_value = str(formatted)
+                    payload: Dict[str, Any] = {
                         "text": lbl.text,
                         "price": lbl.y,
-                        "display": display,
+                        "display": display_value or default_display,
                         "time": lbl.x,
                         "time_display": format_timestamp(lbl.x),
+                        "style": lbl.style,
+                        "color": lbl.color,
+                        "yloc": lbl.yloc,
                     }
+                    if extra:
+                        payload.update(extra)
+                    events[key] = payload
                     break
 
         def record_box(
@@ -1694,7 +1747,21 @@ class SmartMoneyAlgoProE5:
             lambda lbl: lbl.text.startswith(f"{self.CHOCH_TEXT} -"),
             lambda lbl: lbl.text,
         )
-        record_label("X", lambda lbl: lbl.text.strip() == "X")
+        def _format_liquidity_sweep(lbl: Label) -> Dict[str, Any]:
+            style = lbl.style
+            if style == "label.style_label_down":
+                side = "buy-side"
+                bias = "bearish"
+            else:
+                side = "sell-side"
+                bias = "bullish"
+            return {
+                "display": f"Liquidity sweep ({side}) @ {format_price(lbl.y)}",
+                "liquidity_side": side,
+                "direction": bias,
+            }
+
+        record_label("X", lambda lbl: lbl.text.strip() == "X", _format_liquidity_sweep)
         record_label(
             "RED_CIRCLE",
             lambda lbl: lbl.style == "label.style_circle" and lbl.color == bear_color,
@@ -8158,24 +8225,41 @@ def render_report(
 
     scanner_section = ""
     if scanner_rows:
-        rows = "\n".join(
-            f"| {row['symbol']} | {row['timeframe']} | {row.get('candles', '')} | "
-            f"{row.get('alerts', 0)} | {row.get('boxes', 0)} | "
-            f"{row.get('metrics', {}).get('demand_zones', 0)} | {row.get('metrics', {}).get('supply_zones', 0)} | "
-            f"{row.get('metrics', {}).get('bullish_fvg', 0)} | {row.get('metrics', {}).get('bearish_fvg', 0)} | "
-            f"{row.get('metrics', {}).get('order_flow_boxes', 0)} | {row.get('metrics', {}).get('scob_colored_bars', 0)} |"
-            for row in scanner_rows
-        )
-        scanner_section = textwrap.dedent(
-            f"""
+        table_rows: List[str] = []
+        for row in scanner_rows:
+            symbol = row.get("symbol", "—")
+            timeframe = row.get("timeframe", "—")
+            for match in row.get("matches", []):
+                direction = str(match.get("direction", "")).lower()
+                if direction == "long":
+                    direction_label = "صفقة شراء"
+                elif direction == "short":
+                    direction_label = "صفقة بيع"
+                else:
+                    direction_label = match.get("direction", "—") or "—"
+                entry_price = match.get("entry_price", match.get("price"))
+                price_text = format_price(entry_price if isinstance(entry_price, (int, float)) else None)
+                ote_range = match.get("ote_range") or []
+                if isinstance(ote_range, (list, tuple)) and len(ote_range) == 2:
+                    ote_text = f"{format_price(ote_range[0])} → {format_price(ote_range[1])}"
+                else:
+                    ote_text = "—"
+                setup = match.get("setup", "—")
+                table_rows.append(
+                    f"| {symbol} | {timeframe} | {direction_label} | {price_text} | {ote_text} | {setup} |"
+                )
+        if table_rows:
+            rows_text = "\n".join(table_rows)
+            scanner_section = textwrap.dedent(
+                f"""
 ## ماسح Binance USDT-M
 
-| الرمز | الإطار الزمني | الشموع | التنبيهات | الصناديق | مناطق الطلب | مناطق العرض | FVG صاعدة | FVG هابطة | Order Flow | SCOB |
-|-------|---------------|--------|-----------|-----------|-------------|--------------|-----------|-----------|------------|------|
-{rows}
+| الرمز | الإطار الزمني | نوع الصفقة | سعر الدخول | نطاق OTE | تفاصيل الإستراتيجية |
+|-------|---------------|-------------|------------|-----------|-----------------------|
+{rows_text}
 
 """
-        )
+            )
 
     content = textwrap.dedent(
         f"""
@@ -8305,6 +8389,54 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
             f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {value_color}{value}{ANSI_RESET}",
             flush=True,
         )
+    strategy_matches = metrics.get("ict_strategy_matches")
+    if isinstance(strategy_matches, list) and strategy_matches:
+        print(f"{ANSI_BOLD}مطابقات استراتيجية ICT متعددة الأطر{ANSI_RESET}", flush=True)
+        for match in strategy_matches:
+            direction = str(match.get("direction", "")).lower()
+            if direction == "long":
+                direction_label = "شراء"
+                color = ANSI_ALERT_BULL
+            elif direction == "short":
+                direction_label = "بيع"
+                color = ANSI_ALERT_BEAR
+            else:
+                direction_label = direction or "اتجاه"
+                color = ANSI_VALUE_ZERO
+            setup = match.get("setup", "")
+            tf_alignment = match.get("timeframe_alignment")
+            if isinstance(tf_alignment, (list, tuple)) and len(tf_alignment) == 2:
+                tf_text = f"{tf_alignment[0]} → {tf_alignment[1]}"
+            else:
+                tf_text = ""
+            header_text = f"{direction_label} ({tf_text})" if tf_text else direction_label
+            print(f"  {color}{ANSI_BOLD}تنبيه ICT: {header_text}{ANSI_RESET} — {setup}", flush=True)
+            for reason in match.get("reasons", []) or []:
+                print(f"    • {reason}", flush=True)
+            ote_range = match.get("ote_range")
+            if isinstance(ote_range, (list, tuple)) and len(ote_range) == 2:
+                print(
+                    f"    • نطاق OTE: {format_price(ote_range[0])} → {format_price(ote_range[1])}",
+                    flush=True,
+                )
+            price_val = match.get("price")
+            if isinstance(price_val, (int, float)):
+                price_val = float(price_val)
+                if not math.isnan(price_val):
+                    print(f"    • السعر عند التقييم: {format_price(price_val)}", flush=True)
+            zone_meta = match.get("metadata", {}).get("zone", {}) if isinstance(match, dict) else {}
+            if isinstance(zone_meta, dict):
+                zone_source = zone_meta.get("source")
+                zone_range = zone_meta.get("range")
+                details: List[str] = []
+                if zone_source:
+                    details.append(str(zone_source))
+                if isinstance(zone_range, (list, tuple)) and len(zone_range) == 2:
+                    details.append(
+                        f"{format_price(zone_range[0])} → {format_price(zone_range[1])}"
+                    )
+                if details:
+                    print(f"    • المنطقة المرجعية: {' | '.join(details)}", flush=True)
     latest_events = metrics.get("latest_events") or {}
     print(f"{ANSI_BOLD}أحدث الإشارات مع الأسعار{ANSI_RESET}", flush=True)
     for key, label in EVENT_DISPLAY_ORDER:
@@ -8414,6 +8546,349 @@ def _collect_recent_event_hits(
     return hits, recent_times
 
 
+@dataclass
+class ICTStrategyMatch:
+    direction: str
+    setup: str
+    ote_range: Tuple[float, float]
+    price: float
+    timeframe_alignment: Tuple[str, str]
+    reasons: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        payload = dataclasses.asdict(self)
+        payload["ote_range"] = list(self.ote_range)
+        payload["timeframe_alignment"] = list(self.timeframe_alignment)
+        # Provide an explicit alias so downstream consumers can label the price
+        # column as an entry level without guessing the semantic meaning.
+        payload.setdefault("entry_price", payload.get("price"))
+        return payload
+
+
+def print_strategy_match_overview(
+    index: int,
+    total: int,
+    symbol: str,
+    matches: Sequence[Union[ICTStrategyMatch, Dict[str, Any]]],
+) -> None:
+    """Render a concise summary for ICT matches discovered during scanning."""
+
+    if not matches:
+        return
+
+    symbol_display = _format_symbol(symbol)
+    header = f"[{index}/{total}] {ANSI_BOLD}{symbol_display}{ANSI_RESET}"
+    print(header, flush=True)
+    for raw in matches:
+        if isinstance(raw, ICTStrategyMatch):
+            match = raw.as_dict()
+        elif isinstance(raw, dict):
+            match = raw
+        else:
+            continue
+        direction = str(match.get("direction", "")).lower()
+        if direction == "long":
+            direction_label = "صفقة شراء"
+            color = ANSI_ALERT_BULL
+        elif direction == "short":
+            direction_label = "صفقة بيع"
+            color = ANSI_ALERT_BEAR
+        else:
+            direction_label = match.get("direction", "اتجاه") or "اتجاه"
+            color = ANSI_VALUE_ZERO
+        entry_price = match.get("entry_price", match.get("price"))
+        price_text = format_price(entry_price if isinstance(entry_price, (int, float)) else None)
+        setup = match.get("setup", "")
+        ote_range = match.get("ote_range")
+        if isinstance(ote_range, (list, tuple)) and len(ote_range) == 2:
+            ote_text = (
+                f"نطاق OTE: {format_price(ote_range[0])} → {format_price(ote_range[1])}"
+            )
+        else:
+            ote_text = ""
+        details = " — ".join(part for part in (setup, ote_text) if part)
+        print(
+            f"    → {color}{direction_label}{ANSI_RESET} @ {price_text}" + (f" | {details}" if details else ""),
+            flush=True,
+        )
+
+
+def _clone_indicator_inputs(inputs: IndicatorInputs) -> IndicatorInputs:
+    return copy.deepcopy(inputs)
+
+
+def _normalise_price_range(a: float, b: float) -> Optional[Tuple[float, float]]:
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return None
+    if math.isnan(float(a)) or math.isnan(float(b)):
+        return None
+    low = float(a)
+    high = float(b)
+    if low > high:
+        low, high = high, low
+    return low, high
+
+
+def _ranges_intersect(a: Optional[Tuple[float, float]], b: Optional[Tuple[float, float]]) -> bool:
+    if a is None or b is None:
+        return False
+    low_a, high_a = a
+    low_b, high_b = b
+    return not (high_a < low_b or high_b < low_a)
+
+
+def _price_in_range(price: Optional[float], rng: Optional[Tuple[float, float]]) -> bool:
+    if price is None or rng is None:
+        return False
+    low, high = rng
+    return low <= price <= high
+
+
+def _collect_box_array(runtime: Any, attr: str, status_attr: Optional[str] = None) -> List[Box]:
+    array = getattr(runtime, attr, None)
+    if not isinstance(array, PineArray):
+        return []
+    statuses = getattr(runtime, status_attr, None) if status_attr else None
+    boxes: List[Box] = []
+    for idx, value in enumerate(array.values):
+        if not isinstance(value, Box):
+            continue
+        if isinstance(statuses, PineArray):
+            try:
+                status_val = statuses.get(idx)
+            except Exception:
+                status_val = None
+            if status_val not in (0,):
+                continue
+        boxes.append(value)
+    return boxes
+
+
+def _collect_fvg_boxes(runtime: Any, bullish: bool) -> List[Box]:
+    holder_name = "bullish_gap_holder" if bullish else "bearish_gap_holder"
+    holder = getattr(runtime, holder_name, None)
+    if not isinstance(holder, PineArray):
+        return []
+    return [box for box in holder.values if isinstance(box, Box)]
+
+
+def _find_zone_match(
+    boxes: Sequence[Box],
+    ote_range: Optional[Tuple[float, float]],
+    price: Optional[float],
+) -> Optional[Dict[str, Any]]:
+    if ote_range is None or price is None:
+        return None
+    for box in boxes:
+        zone_range = _normalise_price_range(box.bottom, box.top)
+        if zone_range is None:
+            continue
+        if not _ranges_intersect(zone_range, ote_range):
+            continue
+        if not _price_in_range(price, zone_range):
+            continue
+        return {
+            "range": list(zone_range),
+            "left": box.left,
+            "right": box.right,
+            "top": box.top,
+            "bottom": box.bottom,
+        }
+    return None
+
+
+def _extract_golden_zone(runtime: Any) -> Tuple[Optional[Tuple[float, float]], int]:
+    box = getattr(runtime, "bxf", None)
+    direction = getattr(runtime, "bxty", 0)
+    if isinstance(box, Box):
+        price_range = _normalise_price_range(box.bottom, box.top)
+        if price_range:
+            return price_range, direction
+    return None, direction
+
+
+def detect_ict_strategy(
+    exchange: Any,
+    symbol: str,
+    base_inputs: IndicatorInputs,
+    tracer: Optional[ExecutionTracer] = None,
+    *,
+    config: Dict[str, Any] = ICT_STRATEGY_RULES,
+) -> List[ICTStrategyMatch]:
+    matches: List[ICTStrategyMatch] = []
+    runtime_cfg = config.get("runtime", {})
+    htf_tf = runtime_cfg.get("htf_timeframe", "15m")
+    ltf_tf = runtime_cfg.get("ltf_timeframe", "1m")
+    htf_limit = int(runtime_cfg.get("htf_lookback", 400) or 400)
+    ltf_limit = int(runtime_cfg.get("ltf_lookback", 1200) or 1200)
+
+    try:
+        htf_candles = fetch_ohlcv(exchange, symbol, htf_tf, htf_limit)
+        ltf_candles = fetch_ohlcv(exchange, symbol, ltf_tf, ltf_limit)
+    except Exception as exc:
+        print(
+            f"تخطي {_format_symbol(symbol)} (فشل تحميل بيانات الاستراتيجية): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return matches
+
+    try:
+        runtime_htf = SmartMoneyAlgoProE5(
+            inputs=_clone_indicator_inputs(base_inputs),
+            base_timeframe=htf_tf,
+            tracer=tracer,
+        )
+        runtime_htf.process(htf_candles)
+        metrics_htf = runtime_htf.gather_console_metrics()
+
+        runtime_ltf = SmartMoneyAlgoProE5(
+            inputs=_clone_indicator_inputs(base_inputs),
+            base_timeframe=ltf_tf,
+            tracer=tracer,
+        )
+        runtime_ltf.process(ltf_candles)
+        metrics_ltf = runtime_ltf.gather_console_metrics()
+    except Exception as exc:
+        print(
+            f"تخطي {_format_symbol(symbol)} (فشل تقييم الاستراتيجية): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return matches
+
+    htf_events = metrics_htf.get("latest_events") or {}
+    ltf_events = metrics_ltf.get("latest_events") or {}
+
+    price_raw = runtime_ltf.series.get("close")
+    price_value: Optional[float]
+    if isinstance(price_raw, (int, float)):
+        price_value = float(price_raw)
+        if math.isnan(price_value):
+            price_value = None
+    else:
+        price_value = None
+
+    ote_range, golden_direction = _extract_golden_zone(runtime_ltf)
+    if ote_range is None:
+        zone_event = ltf_events.get("GOLDEN_ZONE") if isinstance(ltf_events, dict) else None
+        if isinstance(zone_event, dict):
+            price_payload = zone_event.get("price")
+            if isinstance(price_payload, (list, tuple)) and len(price_payload) == 2:
+                ote_range = _normalise_price_range(price_payload[0], price_payload[1])
+
+    sweep_event = ltf_events.get("X") if isinstance(ltf_events, dict) else None
+
+    demand_boxes = _collect_box_array(runtime_ltf, "demandZone", "demandZoneIsMit")
+    supply_boxes = _collect_box_array(runtime_ltf, "supplyZone", "supplyZoneIsMit")
+    bullish_fvg_boxes = _collect_fvg_boxes(runtime_ltf, True)
+    bearish_fvg_boxes = _collect_fvg_boxes(runtime_ltf, False)
+
+    # Long setup ------------------------------------------------------------
+    bos_event = htf_events.get("BOS") if isinstance(htf_events, dict) else None
+    bullish_htf = bos_event if isinstance(bos_event, dict) and bos_event.get("direction") == "bullish" else None
+    sweep_sell = (
+        sweep_event
+        if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "sell-side"
+        else None
+    )
+    zone_match_long = _find_zone_match(demand_boxes, ote_range, price_value)
+    zone_source_long = "demand_ob" if zone_match_long else None
+    if zone_match_long is None:
+        alt_match = _find_zone_match(bullish_fvg_boxes, ote_range, price_value)
+        if alt_match is not None:
+            zone_match_long = alt_match
+            zone_source_long = "bullish_fvg"
+
+    if (
+        bullish_htf
+        and sweep_sell
+        and zone_match_long is not None
+        and ote_range is not None
+        and golden_direction >= 0
+        and price_value is not None
+    ):
+        reasons = [
+            f"HTF {htf_tf} BOS صاعد مؤكد",
+            "LTF 1m سحب سيولة بيعي (sell-side sweep)",
+            "السعر داخل منطقة طلب/FVG صاعدة ضمن نطاق OTE",
+        ]
+        metadata = {
+            "htf_event": {"key": "BOS", **bullish_htf},
+            "ltf_sweep": sweep_sell,
+            "zone": {"source": zone_source_long, **zone_match_long},
+            "golden_direction": golden_direction,
+        }
+        matches.append(
+            ICTStrategyMatch(
+                direction="long",
+                setup="Bullish BOS + sell-side sweep + OTE confluence",
+                ote_range=ote_range,
+                price=price_value,
+                timeframe_alignment=(htf_tf, ltf_tf),
+                reasons=reasons,
+                metadata=metadata,
+            )
+        )
+
+    # Short setup -----------------------------------------------------------
+    bearish_event: Optional[Dict[str, Any]] = None
+    bearish_key = None
+    for candidate in ("BOS", "CHOCH"):
+        event = htf_events.get(candidate) if isinstance(htf_events, dict) else None
+        if isinstance(event, dict) and event.get("direction") == "bearish":
+            bearish_event = event
+            bearish_key = candidate
+            break
+
+    sweep_buy = (
+        sweep_event
+        if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "buy-side"
+        else None
+    )
+    zone_match_short = _find_zone_match(supply_boxes, ote_range, price_value)
+    zone_source_short = "supply_ob" if zone_match_short else None
+    if zone_match_short is None:
+        alt_match = _find_zone_match(bearish_fvg_boxes, ote_range, price_value)
+        if alt_match is not None:
+            zone_match_short = alt_match
+            zone_source_short = "bearish_fvg"
+
+    if (
+        bearish_event
+        and sweep_buy
+        and zone_match_short is not None
+        and ote_range is not None
+        and golden_direction <= 0
+        and price_value is not None
+    ):
+        reasons = [
+            f"HTF {htf_tf} {bearish_key} هابط مؤكد",
+            "LTF 1m سحب سيولة شرائي (buy-side sweep)",
+            "السعر داخل منطقة عرض/FVG هابطة ضمن نطاق OTE",
+        ]
+        metadata = {
+            "htf_event": {"key": bearish_key, **bearish_event},
+            "ltf_sweep": sweep_buy,
+            "zone": {"source": zone_source_short, **zone_match_short},
+            "golden_direction": golden_direction,
+        }
+        matches.append(
+            ICTStrategyMatch(
+                direction="short",
+                setup="Bearish BOS/CHOCH + buy-side sweep + OTE confluence",
+                ote_range=ote_range,
+                price=price_value,
+                timeframe_alignment=(htf_tf, ltf_tf),
+                reasons=reasons,
+                metadata=metadata,
+            )
+        )
+
+    return matches
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -8430,6 +8905,14 @@ def scan_binance(
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    if inputs is None:
+        inputs = IndicatorInputs()
+    else:
+        inputs = copy.deepcopy(inputs)
+    inputs.fvg.show_fvg = True
+    inputs.structure_util.isOTE = True
+    inputs.structure_util.markX = True
+    inputs.structure_util.showSw = True
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -8450,7 +8933,9 @@ def scan_binance(
         else:
             window = 2
     window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
+    total_symbols = len(all_symbols)
+    matches_found = 0
+    for idx, symbol in enumerate(all_symbols, 1):
         try:
             ticker = exchange.fetch_ticker(symbol)
         except Exception as exc:
@@ -8480,27 +8965,19 @@ def scan_binance(
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
+        strategy_matches = detect_ict_strategy(exchange, symbol, inputs, tracer)
+        if not strategy_matches:
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
-                    "symbol_skipped_stale_events",
+                    "symbol_no_strategy_match",
                     timestamp=runtime.series.get_time(0) or None,
                     symbol=symbol,
                     timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
                 )
             continue
 
+        metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
         metrics["daily_change_percent"] = daily_change
         summaries.append(
             {
@@ -8510,9 +8987,11 @@ def scan_binance(
                 "alerts": metrics.get("alerts", len(runtime.alerts)),
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
+                "matches": metrics["ict_strategy_matches"],
             }
         )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+        matches_found += 1
+        print_strategy_match_overview(idx, total_symbols, symbol, strategy_matches)
         if tracer and tracer.enabled:
             tracer.log(
                 "scan",
@@ -8524,6 +9003,9 @@ def scan_binance(
             )
         if primary_runtime is None:
             primary_runtime = runtime
+    if matches_found == 0:
+        print("لم يتم العثور على عملات تطابق استراتيجية ICT في الوقت الحالي.", flush=True)
+
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.process([])
