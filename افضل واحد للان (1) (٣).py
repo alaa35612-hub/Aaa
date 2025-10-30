@@ -8872,9 +8872,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
     parser.add_argument(
+        "--continuous",
         "--continuous-scan",
-        action="store_true",
-        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف",
+        dest="continuous_scan",
+        action=_OptionalBoolAction,
+        default=False,
+        help="تشغيل ماسح Binance في حلقة متواصلة بدون توقف (يدعم true/false)",
+    )
+    parser.add_argument(
+        "--no-continuous",
+        "--no-continuous-scan",
+        dest="continuous_scan",
+        action="store_false",
+        help="تعطيل حلقة المسح المستمرة",
     )
     parser.add_argument(
         "--scan-interval",
@@ -9043,6 +9053,36 @@ def _normalize_list(csv_like: str) -> List[str]:
     if not csv_like:
         return []
     return [x.strip().upper() for x in csv_like.split(",") if x.strip()]
+
+
+def _parse_bool_token(token: str) -> bool:
+    normalized = token.strip().lower()
+    if normalized in {"1", "true", "yes", "on", "y", "enable", "enabled"}:
+        return True
+    if normalized in {"0", "false", "no", "off", "n", "disable", "disabled"}:
+        return False
+    raise ValueError(f"قيمة منطقية غير صالحة: {token!r}")
+
+
+class _OptionalBoolAction(argparse.Action):
+    """argparse action allowing ``--flag`` or ``--flag=false`` patterns."""
+
+    def __init__(self, option_strings, dest, **kwargs):  # type: ignore[override]
+        if "nargs" in kwargs:
+            raise ValueError("_OptionalBoolAction لا يدعم تحديد nargs")
+        kwargs.setdefault("default", False)
+        super().__init__(option_strings, dest, nargs="?", **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
+        if values is None:
+            setattr(namespace, self.dest, True)
+            return
+        try:
+            parsed = _parse_bool_token(str(values))
+        except ValueError as exc:
+            parser.error(str(exc))
+        setattr(namespace, self.dest, parsed)
+
 
 # ----------------------------- CLI Settings ----------------------------------
 @dataclass
@@ -10030,13 +10070,13 @@ def _parse_args_android():
         default=default_metric,
         help="المقياس المستخدم لترتيب الرابحين {percentage, pricechange, lastprice}",
     )
-    p.set_defaults(continuous=EDITOR_AUTORUN_DEFAULTS.continuous_scan)
     p.add_argument(
         "--continuous",
         "--continuous-scan",
         dest="continuous",
-        action="store_true",
-        help="تشغيل المسح بشكل مستمر بدون توقف",
+        action=_OptionalBoolAction,
+        default=EDITOR_AUTORUN_DEFAULTS.continuous_scan,
+        help="تشغيل المسح بشكل مستمر بدون توقف (يدعم true/false)",
     )
     p.add_argument(
         "--no-continuous",
