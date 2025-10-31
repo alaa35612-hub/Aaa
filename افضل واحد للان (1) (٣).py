@@ -7374,19 +7374,53 @@ class SmartMoneyAlgoProE5:
                 self.bxf.set_right(time_val)
             ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
             ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
-            if oi1 is not None:
+            has_anchor = oi1 is not None
+            has_bounds = not math.isnan(ot) and not math.isnan(ob)
+            if has_anchor and has_bounds:
                 if self.bxf and self.bxf in self.boxes:
                     self._golden_zone_touch_state = None
                     self._golden_zone_last_touch_time = None
                     self.boxes.remove(self.bxf)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
-                self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
-                self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = float(oi1)
+                top_val = max(ot, ob)
+                bot_val = min(ot, ob)
+                if not math.isclose(top_val, bot_val, rel_tol=1e-9, abs_tol=1e-9):
+                    self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
+                    self.bxf.set_text("Golden zone")
+                    self.bxf.set_text_color(self.inputs.structure_util.oteclr)
+                    self._register_box_event(self.bxf, status="new")
+                    self.bxty = 1 if dir_up else -1
+                    self.prev_oi1 = float(oi1)
+                else:
+                    if self.bxf and self.bxf in self.boxes:
+                        self._golden_zone_touch_state = None
+                        self._golden_zone_last_touch_time = None
+                        self.boxes.remove(self.bxf)
+                    self.bxf = None
+                    self.bxty = 0
+            else:
+                if self.bxf and self.bxf in self.boxes:
+                    self._golden_zone_touch_state = None
+                    self._golden_zone_last_touch_time = None
+                    self.boxes.remove(self.bxf)
+                self.bxf = None
+                self.bxty = 0
+        else:
+            if self.bxf and self.bxf in self.boxes:
+                self._golden_zone_touch_state = None
+                self._golden_zone_last_touch_time = None
+                self.boxes.remove(self.bxf)
+            self.bxf = None
+            self.bxty = 0
+
+        if isinstance(self.bxf, Box):
+            zone_top = max(self.bxf.top, self.bxf.bottom)
+            zone_bottom = min(self.bxf.top, self.bxf.bottom)
+            high = self.series.get("high")
+            low = self.series.get("low")
+            if high >= zone_bottom and low <= zone_top:
+                if self._golden_zone_last_touch_time != time_val:
+                    status = "touched" if self._golden_zone_touch_state != "touched" else "retest"
+                    self._register_box_event(self.bxf, status=status, event_time=time_val)
 
         if isinstance(self.bxf, Box):
             zone_top = max(self.bxf.top, self.bxf.bottom)
