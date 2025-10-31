@@ -9213,7 +9213,7 @@ def _extract_golden_zone(runtime: Any) -> Tuple[Optional[Tuple[float, float]], i
 
 
 class BinanceUSDMAsyncSession:
-    _RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
+    _RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
 
     def __init__(self, exchange: Any, concurrency: int) -> None:
         self.exchange = exchange
@@ -9253,7 +9253,7 @@ class BinanceUSDMAsyncSession:
             exchange = ccxt_async.binanceusdm(
                 {
                     "enableRateLimit": True,
-                    "timeout": 20_000,
+                    "timeout": 60_000,
                     "options": {
                         "defaultType": "future",
                         "adjustForTimeDifference": True,
@@ -9262,6 +9262,11 @@ class BinanceUSDMAsyncSession:
             )
 
         try:
+            load_time_diff = getattr(exchange, "load_time_difference", None)
+            if callable(load_time_diff):
+                with contextlib.suppress(Exception):
+                    await load_time_diff()
+
             delays = list(cls._RETRY_DELAYS)
             for attempt in range(len(delays) + 1):
                 try:
