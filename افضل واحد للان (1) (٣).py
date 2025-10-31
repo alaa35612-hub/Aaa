@@ -9029,13 +9029,20 @@ def _evaluate_condition_sequence(
 ) -> Tuple[List[ICTConditionStatus], List[str], str]:
     conditions: List[ICTConditionStatus] = []
     pending_labels: List[str] = []
+    blocked = False
     for idx, (title, evaluator) in enumerate(steps, 1):
-        try:
-            met, detail = evaluator()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            met = False
-            detail = f"تعذر تقييم الشرط: {exc}"
         label = f"الشرط {idx}: {title}"
+        if blocked:
+            met = False
+            detail = "لم يتم تقييم الشرط بسبب انتظار اكتمال الشرط السابق"
+        else:
+            try:
+                met, detail = evaluator()
+            except Exception as exc:  # pragma: no cover - defensive logging
+                met = False
+                detail = f"تعذر تقييم الشرط: {exc}"
+            if not met:
+                blocked = True
         conditions.append(ICTConditionStatus(name=label, met=bool(met), detail=detail))
         if not met:
             pending_labels.append(label)
