@@ -36,7 +36,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 try:
     import ccxt  # type: ignore
@@ -8403,26 +8403,34 @@ EVENT_DISPLAY_ORDER = [
 
 
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
-    header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
     symbol_display = _format_symbol(symbol)
-    header_lines = [
-        f"{header_color}{ANSI_BOLD}════ تحليل {symbol_display}{header_color}{ANSI_BOLD} ({timeframe}) ════{ANSI_RESET}",
-        f"{ANSI_DIM}عدد الشموع: {candle_count}{ANSI_RESET}",
-    ]
+    print(f"\n===== {symbol_display} ({timeframe}) تحليل =====", flush=True)
+
+    meta_parts: List[str] = [f"عدد الشموع: {candle_count}"]
     price_value = metrics.get("current_price")
     if isinstance(price_value, (int, float)):
         price_value = float(price_value)
         if not math.isnan(price_value):
-            header_lines.append(f"{ANSI_DIM}السعر الحالي: {format_price(price_value)}{ANSI_RESET}")
+            meta_parts.append(f"السعر الحالي: {format_price(price_value)}")
     elif isinstance(price_value, str):
-        header_lines.append(f"{ANSI_DIM}السعر الحالي: {price_value}{ANSI_RESET}")
+        meta_parts.append(f"السعر الحالي: {price_value}")
     change_value = metrics.get("daily_change_percent")
     if isinstance(change_value, (int, float)):
-        header_lines.append(
-            f"{ANSI_DIM}تغير 24 ساعة: {change_value:+.2f}%{ANSI_RESET}"
-        )
-    header = "\n".join(header_lines)
-    print(header, flush=True)
+        meta_parts.append(f"تغير 24 ساعة: {change_value:+.2f}%")
+    metric_value = metrics.get("performance_metric_value")
+    metric_name = metrics.get("performance_metric_name") or ICT_PERFORMANCE_SETTINGS.metric_name
+    metric_units = metrics.get("performance_metric_units") or ICT_PERFORMANCE_SETTINGS.display_units
+    if isinstance(metric_value, (int, float)):
+        metric_text = f"{metric_value:.2f}"
+        if isinstance(metric_units, str) and metric_units.strip():
+            units = metric_units.strip()
+            if units.startswith("%"):
+                metric_text = f"{metric_text}{units}"
+            else:
+                metric_text = f"{metric_text} {units}"
+        meta_parts.append(f"{metric_name}: {metric_text}")
+    print("  |  ".join(meta_parts), flush=True)
+
     for key, label in METRIC_LABELS:
         value = metrics.get(key, 0)
         value_color = ANSI_VALUE_POS if value > 0 else ANSI_VALUE_ZERO
@@ -8430,6 +8438,13 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
             f"  {ANSI_LABEL}{label:<26}{ANSI_RESET}: {value_color}{value}{ANSI_RESET}",
             flush=True,
         )
+
+    errors = metrics.get("ict_strategy_errors")
+    if isinstance(errors, list) and errors:
+        print(f"{ANSI_ALERT_BEAR}{ANSI_BOLD}تحذيرات تحميل البيانات:{ANSI_RESET}", flush=True)
+        for message in errors:
+            print(f"  {ANSI_ALERT_BEAR}- {message}{ANSI_RESET}", flush=True)
+
     strategy_matches = metrics.get("ict_strategy_matches")
     if isinstance(strategy_matches, list) and strategy_matches:
         print(f"{ANSI_BOLD}مطابقات استراتيجية ICT متعددة الأطر{ANSI_RESET}", flush=True)
@@ -8460,11 +8475,12 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
                     f"    • نطاق OTE: {format_price(ote_range[0])} → {format_price(ote_range[1])}",
                     flush=True,
                 )
-            price_val = match.get("price")
+            entry_value = match.get("entry_price", match.get("price"))
+            price_val = entry_value
             if isinstance(price_val, (int, float)):
                 price_val = float(price_val)
                 if not math.isnan(price_val):
-                    print(f"    • السعر عند التقييم: {format_price(price_val)}", flush=True)
+                    print(f"    • سعر الدخول المقدر: {format_price(price_val)}", flush=True)
             zone_meta = match.get("metadata", {}).get("zone", {}) if isinstance(match, dict) else {}
             if isinstance(zone_meta, dict):
                 zone_source = zone_meta.get("source")
@@ -8478,10 +8494,13 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
                     )
                 if details:
                     print(f"    • المنطقة المرجعية: {' | '.join(details)}", flush=True)
-    latest_events = metrics.get("latest_events") or {}
+
+    latest_events = metrics.get("latest_events") if isinstance(metrics, dict) else None
+    if not isinstance(latest_events, dict):
+        latest_events = {}
     print(f"{ANSI_BOLD}أحدث الإشارات مع الأسعار{ANSI_RESET}", flush=True)
     for key, label in EVENT_DISPLAY_ORDER:
-        event = latest_events.get(key)
+        event = latest_events.get(key) if isinstance(latest_events, dict) else None
         if event:
             display_text = event.get("display")
             if display_text is None:
@@ -8515,7 +8534,6 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
             flush=True,
         )
     print(f"{ANSI_DIM}{'-'*48}{ANSI_RESET}", flush=True)
-
 
 def print_trace_comparison(result: TraceComparisonResult) -> None:
     status = "مطابق" if result.matches else "اختلاف"
@@ -8871,6 +8889,25 @@ def _extract_golden_zone(runtime: Any) -> Tuple[Optional[Tuple[float, float]], i
     return None, direction
 
 
+def _candles_from_cache(
+    cache: Optional[Mapping[str, Sequence[Dict[str, float]]]],
+    timeframe: str,
+) -> Optional[List[Dict[str, float]]]:
+    if not cache or not timeframe:
+        return None
+    try:
+        raw = cache.get(timeframe)  # type: ignore[call-arg]
+    except AttributeError:
+        raw = None
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return raw  # assume already normalised
+    if isinstance(raw, tuple):
+        return list(raw)
+    return None
+
+
 def detect_ict_strategy(
     exchange: Any,
     symbol: str,
@@ -8878,6 +8915,7 @@ def detect_ict_strategy(
     tracer: Optional[ExecutionTracer] = None,
     *,
     config: Dict[str, Any] = ICT_STRATEGY_RULES,
+    candles_cache: Optional[Mapping[str, Sequence[Dict[str, float]]]] = None,
 ) -> List[ICTStrategyMatch]:
     matches: List[ICTStrategyMatch] = []
     if not ICT_STRATEGY_SETTINGS.enabled:
@@ -8895,8 +8933,12 @@ def detect_ict_strategy(
     allow_fvg = bool(runtime_cfg.get("allow_fvg", ICT_STRATEGY_SETTINGS.allow_fvg))
 
     try:
-        htf_candles = fetch_ohlcv(exchange, symbol, htf_tf, htf_limit)
-        ltf_candles = fetch_ohlcv(exchange, symbol, ltf_tf, ltf_limit)
+        htf_candles = _candles_from_cache(candles_cache, htf_tf)
+        if htf_candles is None:
+            htf_candles = fetch_ohlcv(exchange, symbol, htf_tf, htf_limit)
+        ltf_candles = _candles_from_cache(candles_cache, ltf_tf)
+        if ltf_candles is None:
+            ltf_candles = fetch_ohlcv(exchange, symbol, ltf_tf, ltf_limit)
     except Exception as exc:
         print(
             f"تخطي {_format_symbol(symbol)} (فشل تحميل بيانات الاستراتيجية): {exc}",
@@ -9148,6 +9190,13 @@ def scan_binance(
     window = max(1, int(window))
     total_symbols = len(all_symbols)
     matches_found = 0
+
+    runtime_cfg = ICT_STRATEGY_RULES.get("runtime", {}) if isinstance(ICT_STRATEGY_RULES, dict) else {}
+    htf_tf = runtime_cfg.get("htf_timeframe", ICT_STRATEGY_SETTINGS.higher_timeframe)
+    ltf_tf = runtime_cfg.get("ltf_timeframe", ICT_STRATEGY_SETTINGS.lower_timeframe)
+    htf_limit = int(runtime_cfg.get("htf_lookback", ICT_STRATEGY_SETTINGS.higher_lookback) or ICT_STRATEGY_SETTINGS.higher_lookback)
+    ltf_limit = int(runtime_cfg.get("ltf_lookback", ICT_STRATEGY_SETTINGS.lower_lookback) or ICT_STRATEGY_SETTINGS.lower_lookback)
+
     for idx, symbol in enumerate(all_symbols, 1):
         try:
             ticker = tickers_map.get(symbol) if isinstance(tickers_map, dict) else None
@@ -9181,8 +9230,93 @@ def scan_binance(
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
-        strategy_matches = detect_ict_strategy(exchange, symbol, inputs, tracer)
+
+        if primary_runtime is None:
+            primary_runtime = runtime
+
+        price_fields = ("last", "close", "price")
+        current_price: Optional[float] = None
+        for field in price_fields:
+            value = ticker.get(field) if isinstance(ticker, dict) else None
+            if isinstance(value, (int, float)):
+                current_price = float(value)
+                break
+        if current_price is None:
+            try:
+                series_price = runtime.series.get("close")
+            except Exception:
+                series_price = None
+            if isinstance(series_price, (int, float)) and not math.isnan(float(series_price)):
+                current_price = float(series_price)
+
+        metrics["current_price"] = current_price
+        metrics["daily_change_percent"] = daily_change
+        metrics["performance_metric_value"] = performance_metric
+        metrics["performance_metric_name"] = ICT_PERFORMANCE_SETTINGS.metric_name
+        metrics["performance_metric_units"] = ICT_PERFORMANCE_SETTINGS.display_units
+
+        strategy_candles: Dict[str, List[Dict[str, float]]] = {timeframe: candles}
+        strategy_errors: List[str] = []
+
+        def _reuse_from_base(base: List[Dict[str, float]], required: int) -> List[Dict[str, float]]:
+            if required > 0 and len(base) > required:
+                return base[-required:]
+            return list(base)
+
+        if htf_tf and htf_tf not in strategy_candles:
+            shared: Optional[List[Dict[str, float]]] = None
+            if htf_tf == timeframe:
+                shared = _reuse_from_base(candles, htf_limit)
+            if shared is not None:
+                strategy_candles[htf_tf] = shared
+            else:
+                try:
+                    strategy_candles[htf_tf] = fetch_ohlcv(exchange, symbol, htf_tf, htf_limit)
+                except Exception as exc:
+                    strategy_errors.append(f"فشل تحميل بيانات {htf_tf}: {exc}")
+
+        if ltf_tf and ltf_tf not in strategy_candles:
+            shared_ltf: Optional[List[Dict[str, float]]] = None
+            if ltf_tf == timeframe:
+                shared_ltf = _reuse_from_base(candles, ltf_limit)
+            if shared_ltf is not None:
+                strategy_candles[ltf_tf] = shared_ltf
+            else:
+                try:
+                    strategy_candles[ltf_tf] = fetch_ohlcv(exchange, symbol, ltf_tf, ltf_limit)
+                except Exception as exc:
+                    strategy_errors.append(f"فشل تحميل بيانات {ltf_tf}: {exc}")
+
+        strategy_matches: List[ICTStrategyMatch] = []
+        if not strategy_errors:
+            strategy_matches = detect_ict_strategy(
+                exchange,
+                symbol,
+                inputs,
+                tracer,
+                candles_cache=strategy_candles,
+            )
+
+        metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
+        metrics["ict_strategy_errors"] = strategy_errors
+
+        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+
+        if strategy_errors and tracer and tracer.enabled:
+            tracer.log(
+                "scan",
+                "strategy_data_error",
+                timestamp=runtime.series.get_time(0) or None,
+                symbol=symbol,
+                timeframe=timeframe,
+                errors=strategy_errors,
+            )
+
         if not strategy_matches:
+            print(
+                f"  {ANSI_DIM}لا توجد مطابقات لاستراتيجية ICT على هذا الرمز حاليًا.{ANSI_RESET}",
+                flush=True,
+            )
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
@@ -9193,9 +9327,7 @@ def scan_binance(
                 )
             continue
 
-        metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
-        metrics["daily_change_percent"] = daily_change
-        metrics["performance_metric_value"] = performance_metric
+        matches_found += 1
         summaries.append(
             {
                 "symbol": symbol,
@@ -9204,12 +9336,10 @@ def scan_binance(
                 "alerts": metrics.get("alerts", len(runtime.alerts)),
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
-                "matches": metrics["ict_strategy_matches"],
+                "matches": strategy_matches,
                 "metric_value": performance_metric,
             }
         )
-        matches_found += 1
-        print_strategy_match_overview(idx, total_symbols, symbol, strategy_matches)
         if tracer and tracer.enabled:
             tracer.log(
                 "scan",
@@ -9219,8 +9349,6 @@ def scan_binance(
                 timeframe=timeframe,
                 candles=len(candles),
             )
-        if primary_runtime is None:
-            primary_runtime = runtime
     if matches_found == 0:
         print("لم يتم العثور على عملات تطابق استراتيجية ICT في الوقت الحالي.", flush=True)
     else:
