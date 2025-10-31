@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import bisect
+import contextlib
 import copy
 import dataclasses
 import datetime
@@ -562,6 +563,11 @@ class ScannerRuntimeInputs:
 
     parallel_tasks: int = 4
     transport: str = "rest"
+    mode: str = "once"
+    poll_interval_seconds: float = 5.0
+    stream_duration_seconds: Optional[float] = None
+    max_cycles: Optional[int] = 1
+    incremental_limit: int = 120
 
 
 @dataclass
@@ -8276,6 +8282,37 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
     return candles
 
 
+def _fetch_incremental_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    since: Optional[int],
+) -> List[Dict[str, float]]:
+    """Fetch a lightweight OHLCV batch anchored at ``since`` for streaming scans."""
+
+    effective_since = since if since and since > 0 else None
+    raw = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=limit,
+        since=effective_since,
+    )
+    candles: List[Dict[str, float]] = []
+    for entry in raw or []:
+        candles.append(
+            {
+                "time": entry[0],
+                "open": entry[1],
+                "high": entry[2],
+                "low": entry[3],
+                "close": entry[4],
+                "volume": entry[5],
+            }
+        )
+    return candles
+
+
 def _split_arguments(argument_string: str) -> List[str]:
     parts: List[str] = []
     current: List[str] = []
@@ -9612,6 +9649,36 @@ def scan_binance(
         raise NotImplementedError(
             f"Transport mode '{transport_mode}' غير مدعوم حاليًا؛ REST فقط متاح"
         )
+    mode = str(_scanner_attr("mode", "once") or "once").lower()
+    poll_interval = _scanner_attr("poll_interval_seconds", 5.0)
+    try:
+        poll_interval = float(poll_interval)
+    except Exception:
+        poll_interval = 5.0
+    if poll_interval < 0:
+        poll_interval = 0.0
+    stream_duration = _scanner_attr("stream_duration_seconds")
+    if stream_duration is not None:
+        try:
+            stream_duration = float(stream_duration)
+        except Exception:
+            stream_duration = None
+        if stream_duration is not None and stream_duration <= 0:
+            stream_duration = None
+    max_cycles_cfg = _scanner_attr("max_cycles")
+    if max_cycles_cfg is not None:
+        try:
+            max_cycles_cfg = int(max_cycles_cfg)
+        except Exception:
+            max_cycles_cfg = None
+        if max_cycles_cfg is not None and max_cycles_cfg <= 0:
+            max_cycles_cfg = None
+    incremental_limit = _scanner_attr("incremental_limit", 120)
+    try:
+        incremental_limit = int(incremental_limit)
+    except Exception:
+        incremental_limit = 120
+    incremental_limit = max(10, incremental_limit)
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -9630,7 +9697,7 @@ def scan_binance(
         else:
             window = 2
     window = max(1, int(window))
-    async def _scan_async() -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+    async def _scan_once_async() -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
         runtime_map: Dict[str, SmartMoneyAlgoProE5] = {}
         summaries_by_index: Dict[int, Dict[str, Any]] = {}
         primary_symbol: Optional[str] = None
@@ -9821,7 +9888,211 @@ def scan_binance(
             primary_runtime.process([])
         return primary_runtime, summaries_sorted
 
-    primary_runtime, summaries = asyncio.run(_scan_async())
+    async def _scan_stream_async() -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+        runtime_map: Dict[str, SmartMoneyAlgoProE5] = {}
+        summaries_by_symbol: Dict[str, Dict[str, Any]] = {}
+        alert_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        cache_lock = asyncio.Lock()
+        semaphore = asyncio.Semaphore(effective_concurrency)
+        timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
+        timeframe_ms = timeframe_seconds * 1000
+        stop_event = asyncio.Event()
+
+        def alert_sink(event: Dict[str, Any]) -> None:
+            alert_queue.put_nowait(event)
+
+        _smoke_test_immediate_alert_sink(alert_queue, alert_sink)
+
+        async def alert_consumer() -> None:
+            while True:
+                event = await alert_queue.get()
+                if event is None:
+                    alert_queue.task_done()
+                    break
+                try:
+                    message = _format_immediate_event_message(event)
+                    print(
+                        _colorize_directional_text(message, direction=event.get("direction")),
+                        flush=True,
+                    )
+                finally:
+                    alert_queue.task_done()
+
+        async def supervisor() -> None:
+            try:
+                if stream_duration is not None:
+                    await asyncio.sleep(stream_duration)
+                    stop_event.set()
+                    return
+                if max_cycles_cfg is None:
+                    return
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                pass
+
+        consumer_task = asyncio.create_task(alert_consumer())
+        supervisor_task = asyncio.create_task(supervisor()) if stream_duration else None
+
+        async def process_symbol(symbol_index: int, symbol: str) -> None:
+            runtime = runtime_map.get(symbol)
+            if runtime is None:
+                runtime = SmartMoneyAlgoProE5(
+                    inputs=_clone_indicator_inputs(inputs),
+                    base_timeframe=timeframe,
+                    tracer=tracer,
+                )
+                runtime_map[symbol] = runtime
+            cycles = 0
+            last_time = runtime.series.get_time(0) if runtime.series.length() > 0 else None
+            first_pass = True
+            while not stop_event.is_set():
+                try:
+                    async with semaphore:
+                        ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+                    ticker_daily_change = _extract_daily_change_percent(ticker)
+                except Exception as exc:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    await asyncio.sleep(max(1.0, poll_interval))
+                    continue
+                if (
+                    first_pass
+                    and min_daily_change > 0.0
+                    and ticker_daily_change is not None
+                    and ticker_daily_change <= min_daily_change
+                ):
+                    print(
+                        f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {ticker_daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                        flush=True,
+                    )
+                    if tracer and tracer.enabled:
+                        tracer.log(
+                            "scan",
+                            "symbol_skipped_daily_change",
+                            timestamp=None,
+                            symbol=symbol,
+                            change=ticker_daily_change,
+                            threshold=min_daily_change,
+                        )
+                    return
+                try:
+                    async with semaphore:
+                        if first_pass:
+                            candles = await asyncio.to_thread(
+                                fetch_ohlcv, exchange, symbol, timeframe, limit
+                            )
+                        else:
+                            since = 0 if last_time is None else max(0, int(last_time - timeframe_ms))
+                            candles = await asyncio.to_thread(
+                                _fetch_incremental_ohlcv,
+                                exchange,
+                                symbol,
+                                timeframe,
+                                incremental_limit,
+                                since,
+                            )
+                except Exception as exc:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ohlcv: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    await asyncio.sleep(max(1.0, poll_interval))
+                    continue
+                first_pass = False
+                candle_count = len(candles)
+                if candles:
+                    if last_time is not None:
+                        new_candles = [c for c in candles if int(c["time"]) > last_time]
+                    else:
+                        new_candles = candles
+                    if new_candles:
+                        runtime.process(new_candles)
+                        last_time = runtime.series.get_time(0)
+                metrics = runtime.gather_console_metrics()
+                latest_events = metrics.get("latest_events") or {}
+                async with cache_lock:
+                    immediate_events = _collect_immediate_events(
+                        symbol,
+                        timeframe,
+                        latest_events,
+                        runtime,
+                        event_cache,
+                        alert_cfg,
+                        event_sink=alert_sink,
+                    )
+                if immediate_events:
+                    metrics.setdefault("immediate_event_alerts", []).extend(immediate_events)
+                metrics["daily_change_percent"] = ticker_daily_change
+                summaries_by_symbol[symbol] = {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": candle_count,
+                    "alerts": metrics.get("alerts", len(runtime.alerts)),
+                    "boxes": metrics.get("boxes", len(runtime.boxes)),
+                    "metrics": metrics,
+                }
+                print_symbol_summary(symbol_index, symbol, timeframe, candle_count, metrics)
+                cycles += 1
+                if max_cycles_cfg is not None and cycles >= max_cycles_cfg:
+                    break
+                if stream_duration is None and max_cycles_cfg is None and poll_interval <= 0:
+                    await asyncio.sleep(timeframe_seconds)
+                else:
+                    await asyncio.sleep(max(0.1, poll_interval))
+            return
+
+        tasks = [
+            asyncio.create_task(process_symbol(idx, symbol))
+            for idx, symbol in enumerate(all_symbols)
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            stop_event.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if supervisor_task:
+                supervisor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await supervisor_task
+            await alert_queue.join()
+            await alert_queue.put(None)
+            await alert_queue.join()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer_task
+
+        summaries_sorted = [
+            summaries_by_symbol[s]
+            for s in sorted(summaries_by_symbol.keys(), key=lambda sym: all_symbols.index(sym))
+        ]
+        primary_runtime: Optional[SmartMoneyAlgoProE5]
+        if all_symbols:
+            primary_runtime = runtime_map.get(all_symbols[0])
+        else:
+            primary_runtime = None
+        if primary_runtime is None and runtime_map:
+            primary_runtime = next(iter(runtime_map.values()))
+        if primary_runtime is None:
+            primary_runtime = SmartMoneyAlgoProE5(
+                inputs=_clone_indicator_inputs(inputs),
+                tracer=tracer,
+            )
+            primary_runtime.process([])
+        return primary_runtime, summaries_sorted
+
+    if mode in {"stream", "live", "continuous"}:
+        coroutine = _scan_stream_async()
+    else:
+        coroutine = _scan_once_async()
+    primary_runtime, summaries = asyncio.run(coroutine)
     if event_cache is not None:
         event_cache.save()
     try:
@@ -9873,6 +10144,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=1,
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
+    parser.add_argument(
+        "--scan-mode",
+        choices=["once", "stream"],
+        default="once",
+        help="حدد 'stream' لتفعيل المراقبة المستمرة الموازية أو 'once' لمسح مفرد",
+    )
+    parser.add_argument(
+        "--scan-poll",
+        type=float,
+        default=5.0,
+        help="الفاصل بالثواني بين الدورات عند تفعيل وضع البث المباشر",
+    )
+    parser.add_argument(
+        "--scan-duration",
+        type=float,
+        default=0.0,
+        help="المدة الكلية بالثواني للبث المباشر (0 يعني حتى استنفاد الدورات)",
+    )
+    parser.add_argument(
+        "--scan-cycles",
+        type=int,
+        default=1,
+        help="عدد الدورات لكل رمز عند البث المباشر (<=0 يعني بلا حد)",
+    )
+    parser.add_argument(
+        "--scan-incremental-limit",
+        type=int,
+        default=120,
+        help="عدد الشموع التي يتم جلبها في كل تحديث متدفق بعد الدفعة الأولى",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
@@ -9893,6 +10194,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     indicator_inputs = IndicatorInputs()
     indicator_inputs.console.max_age_bars = args.max_age_bars
+    indicator_inputs.scanner_runtime.mode = args.scan_mode
+    indicator_inputs.scanner_runtime.poll_interval_seconds = args.scan_poll
+    indicator_inputs.scanner_runtime.stream_duration_seconds = (
+        args.scan_duration if args.scan_duration > 0 else None
+    )
+    indicator_inputs.scanner_runtime.max_cycles = (
+        args.scan_cycles if args.scan_cycles > 0 else None
+    )
+    indicator_inputs.scanner_runtime.incremental_limit = max(10, args.scan_incremental_limit)
 
     if args.pullback_report:
         log("Foundation")
