@@ -22,13 +22,16 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import bisect
+import contextlib
 import copy
 import dataclasses
 import datetime
 import inspect
 import json
 import math
+import os
 import re
 import sys
 import textwrap
@@ -42,6 +45,11 @@ try:
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     ccxt = None  # type: ignore
+
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    requests = None  # type: ignore
 
 
 # ----------------------------------------------------------------------------
@@ -132,6 +140,864 @@ ICT_STRATEGY_RULES: Dict[str, Any] = {
         "ote_ratio": (0.62, 0.79),
     },
 }
+
+
+# ----------------------------------------------------------------------------
+# Centralised indicator configuration defaults
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class PullbackInputs:
+    showHL: bool = False
+    colorHL: str = "#000000"
+    showMn: bool = False
+
+
+@dataclass
+class CustomPoint:
+    """Support/resistance pivot point container mirroring Pine ``line.new`` usage."""
+
+    time: int
+    price: float
+    tr: float
+
+
+@dataclass
+class SupportResistanceLevel:
+    """State bundle for a clustered support/resistance level."""
+
+    rs_type: str
+    timeframe: str
+    price: float
+    points: List[CustomPoint] = field(default_factory=list)
+    line: Optional["Line"] = None
+    box: Optional["Box"] = None
+    price_label: Optional["Label"] = None
+    break_label: Optional["Label"] = None
+    break_line: Optional["Line"] = None
+    break_box: Optional["Box"] = None
+    retest_labels: List["Label"] = field(default_factory=list)
+    is_broken: bool = False
+    broken_time: Optional[int] = None
+    break_level: float = NA
+    break_tr: float = 0.0
+    last_retest_bar: Optional[int] = None
+    last_retest_time: Optional[int] = None
+    last_break_alert_time: Optional[int] = None
+    last_retest_alert_time: Optional[int] = None
+
+
+@dataclass
+class MarketStructureInputs:
+    showSMC: bool = True
+    lengSMC: int = 40
+    colorIDM: str = "color.rgb(0, 0, 0, 20)"
+    structure_type: str = "Choch with IDM"
+    showCircleHL: bool = True
+    bull: str = "color.green"
+    bear: str = "color.red"
+
+
+@dataclass
+class OrderBlockInputs:
+    extndBox: bool = True
+    showExob: bool = True
+    showIdmob: bool = True
+    showBrkob: bool = True
+    txtsiz: str = "size.auto"
+    clrtxtextbullbg: str = "color.rgb(76, 175, 79, 86)"
+    clrtxtextbearbg: str = "color.rgb(255, 82, 82, 83)"
+    clrtxtextbulliembg: str = "color.rgb(76, 175, 79, 86)"
+    clrtxtextbeariembg: str = "color.rgb(255, 82, 82, 86)"
+    clrtxtextbull: str = "color.green"
+    clrtxtextbear: str = "color.red"
+    clrtxtextbulliem: str = "color.green"
+    clrtxtextbeariem: str = "color.red"
+    showPOI: bool = True
+    poi_type: str = "Mother Bar"
+    colorSupply: str = "#cd5c4800"
+    colorDemand: str = "#2f825f00"
+    colorMitigated: str = "#c0c0c000"
+    showSCOB: bool = True
+    scobUp: str = "#0b3ff9"
+    scobDn: str = "#da781d"
+
+
+@dataclass
+class DemandSupplyInputs:
+    show_order_blocks: bool = False
+    ibull_ob_css: str = "#5f6b5d19"
+    ibear_ob_css: str = "#ef3a3a19"
+    ob_type__: str = "All"
+    i_tf_ob: str = ""
+    mittigation_filt: str = "wick"
+    overlapping_filt: bool = True
+    max_obs: int = 8
+    length_extend_ob: int = 20
+    ob_extend: bool = False
+    text_size_ob_: str = "size.normal"
+    ob_text_color_1: str = "color.new(#787b86, 0)"
+    volume_text: bool = False
+    percent_text: bool = False
+    show_line_ob_1: bool = False
+    line_style_ob_1: str = "line.style_solid"
+    show_order_blocks_mtf: bool = False
+    ibull_ob_css_2: str = "color.new(#5d606b, 25)"
+    ibear_ob_css_2: str = "color.new(#5d606b, 25)"
+    ob_type__mtf: str = "All"
+    i_tf_ob_mtf: str = "240"
+    mittigation_filt_mtf: str = "Wicks"
+    overlapping_filt_mtf: bool = True
+    max_obs_mtf: int = 4
+    length_extend_ob_mtf: int = 20
+    ob_extend_mtf: bool = False
+    text_size_ob_2: str = "size.small"
+    ob_text_color_2: str = "color.new(#787b86, 0)"
+    volume_text_2: bool = False
+    percent_text_2: bool = False
+    show_line_ob_2: bool = False
+    line_style_ob_2: str = "line.style_solid"
+    v_buy: str = "#00dbff4d"
+    v_sell: str = "#e91e634d"
+    ob_showlast: int = 5
+    iob_showlast: int = 5
+    max_width_ob: float = 3.0
+    style: str = "Colored"
+    v_lookback: int = 10
+    ob_loockback: int = 10
+
+
+@dataclass
+class FVGInputs:
+    show_fvg: bool = False
+    i_tf: str = ""
+    i_mtf: str = "HTF"
+    i_bullishfvgcolor: str = "color.new(color.green,100)"
+    i_bearishfvgcolor: str = "color.new(color.green,90)"
+    remove_small: bool = True
+    mittigation_filt_fvg: str = "Touch"
+    fvg_color_fill: bool = True
+    fvg_shade_fill: bool = False
+    max_fvg: int = 8
+    length_extend: int = 20
+    fvg_extend: bool = False
+    fvg_extend_B: bool = True
+    i_fillByMid: bool = True
+    i_deleteonfill: bool = True
+    i_textColor: str = "color.white"
+    i_tfos: int = 10
+    i_mtfos: int = 50
+    max_width_fvg: float = 1.5
+    i_mtfbearishfvgcolor: str = "color.yellow"
+    i_mtfbullishfvgcolor: str = "color.yellow"
+    mid_style: str = "Solid"
+    i_midPointColor: str = "color.rgb(249, 250, 253, 99)"
+
+
+@dataclass
+class LiquidityInputs:
+    currentTF: bool = False
+    displayLimit: int = 20
+    lowLineColorHTF: str = "#00bbf94d"
+    highLineColorHTF: str = "#e91e624d"
+    htfTF: str = ""
+    _candleType: str = "Close"
+    leftBars: int = 20
+    mitiOptions: str = "Remove"
+    length_extend_liq: int = 20
+    extentionMax: bool = False
+    _highLineStyleHTF: str = "Solid"
+    box_width: float = 2.5
+    lineWidthHTF: int = 2
+    liquidity_text_color: str = "color.black"
+    highBoxBorderColorHTF: str = "color.new(#e91e624d,90)"
+    lowBoxBorderColorHTF: str = "color.new(#00bbf94d,90)"
+    displayStyle_liq: str = "Boxes"
+
+
+@dataclass
+class OrderFlowInputs:
+    showMajoinMiner: bool = False
+    showISOB: bool = True
+    showMajoinMinerMax: int = 10
+    showISOBMax: int = 10
+    showTsted: bool = False
+    maxTested: int = 20
+    ClrMajorOFBull: str = "color.rgb(33, 149, 243, 71)"
+    ClrMajorOFBear: str = "color.rgb(33, 149, 243, 72)"
+    ClrMinorOFBull: str = "color.rgb(155, 39, 176, 81)"
+    ClrMinorOFBear: str = "color.rgb(155, 39, 176, 86)"
+    clrObBBTated: str = "color.rgb(136, 142, 252, 86)"
+
+
+@dataclass
+class CandleInputs:
+    showISB: bool = False
+    colorOSB_up: str = "#0b3ff9"
+    showOSB: bool = False
+    colorOSB_down: str = "#da781d"
+    colorISB: str = "color.rgb(187, 6, 247, 77)"
+    label_color_bearish: str = "color.rgb(255, 82, 82, 90)"
+    label_color_bullish: str = "color.rgb(33, 149, 243, 90)"
+    trendRule: str = "SMA50"
+
+
+@dataclass
+class ConsoleInputs:
+    max_age_bars: int = 1
+
+
+@dataclass
+class LogicToggleInputs:
+    """Master switches to enable or disable each logic package."""
+
+    enable_pullback: bool = True
+    enable_market_structure: bool = True
+    enable_order_block: bool = True
+    enable_demand_supply: bool = True
+    enable_fvg: bool = True
+    enable_liquidity: bool = True
+    enable_order_flow: bool = True
+    enable_candle_patterns: bool = True
+    enable_structure_util: bool = True
+    enable_ict_structure: bool = True
+    enable_key_levels: bool = True
+    enable_sessions: bool = True
+    enable_swing_detection: bool = True
+    enable_zigzag: bool = True
+    enable_support_resistance: bool = True
+
+
+@dataclass
+class AlertLogicInputs:
+    """Centralised switches controlling the unified alert workflow."""
+
+    enable_all_alerts: bool = True
+    enable_choch_correction_alert: bool = True
+    enable_idm_ob_retest_alert: bool = True
+    enable_ext_ob_retest_alert: bool = True
+    enable_golden_zone_retest_alert: bool = True
+
+
+@dataclass
+class StructureInputs:
+    isOTE: bool = False
+    ote1: float = 0.78
+    ote2: float = 0.61
+    oteclr: str = "#ff95002b"
+    sizGd: str = "size.normal"
+    showPdh: bool = False
+    lengPdh: int = 40
+    showPdl: bool = False
+    lengPdl: int = 40
+    showMid: bool = True
+    lengMid: int = 40
+    showSw: bool = True
+    markX: bool = False
+    colorSweep: str = "color.gray"
+    showTP: bool = False
+
+
+@dataclass
+class ICTMarketStructureInputs:
+    showms: bool = False
+    bosColor1: str = "color.green"
+    bosColor2: str = "color.red"
+    ms_type: str = "All"
+    show_equal_highlow: bool = False
+    eq_bear_color: str = "#787b86"
+    eq_bull_color: str = "#787b86"
+    eq_threshold: float = 0.3
+    label_sizes_s: str = "Medium"
+    swingSize: int = 10
+    showSwing: bool = False
+
+
+@dataclass
+class KeyLevelsInputs:
+    Show_4H_Levels: bool = False
+    Color_4H_Levels: str = "color.orange"
+    Style_4H_Levels: str = "Dotted"
+    Text_4H_Levels: bool = True
+    Show_Daily_Levels: bool = False
+    Color_Daily_Levels: str = "#08bcd4"
+    Style_Daily_Levels: str = "Dotted"
+    Text_Daily_Levels: bool = True
+    Show_Monday_Levels: bool = False
+    Color_Monday_Levels: str = "color.white"
+    Style_Monday_Levels: str = "Dotted"
+    Text_Monday_Levels: bool = True
+    Show_Weekly_Levels: bool = False
+    WeeklyColor: str = "#fffcbc"
+    Weekly_style: str = "Dotted"
+    WeeklyTextType: bool = True
+    Show_Monthly_Levels: bool = False
+    MonthlyColor: str = "#098c30"
+    Monthly_style: str = "Dotted"
+    MonthlyTextType: bool = True
+    Show_Quaterly_Levels: bool = False
+    quarterlyColor: str = "#bcffd0"
+    Quaterly_style: str = "Dotted"
+    QuarterlyTextType: bool = True
+    Show_Yearly_Levels: bool = False
+    YearlyColor: str = "#ffbcdb"
+    Yearly_style: str = "Dotted"
+    YearlyTextType: bool = True
+    labelsize: str = "Small"
+    displayStyle: str = "Standard"
+    distanceright: int = 25
+    radistance: int = 250
+    linesize: str = "Small"
+    linestyle: str = "Solid"
+
+
+@dataclass
+class SessionInputs:
+    is_londonrange_enabled: bool = False
+    london_OC: bool = True
+    london_HL: bool = True
+    is_usrange_enabled: bool = False
+    us_OC: bool = True
+    us_HL: bool = True
+    is_tokyorange_enabled: bool = False
+    asia_OC: bool = True
+    asia_HL: bool = True
+    SessionTextType: bool = False
+    Londont: str = "0800-1600"
+    USt: str = "1400-2100"
+    Asiat: str = "0000-0900"
+    LondonColor: str = "color.rgb(15, 13, 13)"
+    USColor: str = "color.rgb(190, 8, 236)"
+    AsiaColor: str = "color.rgb(33, 5, 241)"
+    Short_text_London: bool = True
+    Short_text_NY: bool = True
+    Short_text_TKY: bool = True
+
+
+@dataclass
+class SwingDetectionInputs:
+    cooldownPeriod: int = 10
+    showSwing_: bool = True
+    swingClr: str = "color.new(color.orange, 0)"
+    bullWidth: int = 1
+    bullStyle: str = "Dashed"
+    bullColor: str = "color.new(color.teal, 0)"
+    bearWidth: int = 1
+    bearStyle: str = "Dashed"
+    bearColor: str = "color.new(color.maroon, 0)"
+    display_third: bool = False
+    length3: int = 20
+    mult: float = 1.0
+    atr_Len: int = 500
+    upCss: str = "#089981"
+    dnCss: str = "#f23645"
+    unbrokenCss: str = "#2157f3"
+
+
+@dataclass
+class ZigZagInputs:
+    length1: int = 100
+    extend: bool = True
+    show_ext: bool = True
+    show_labels: bool = True
+    upcol: str = "#ff1100"
+    midcol: str = "#ff5d00"
+    dncol: str = "#2157f3"
+
+
+@dataclass
+class SupportResistanceInputs:
+    resistanceSupportCount: int = 3
+    pivotRange: int = 15
+    strength: int = 1
+    expandLines: bool = True
+    enableZones: bool = False
+    zoneWidthType: str = "Dynamic"
+    zoneWidth: int = 1
+    timeframe1Enabled: bool = True
+    timeframe1_: str = ""
+    timeframe2Enabled: bool = True
+    timeframe2: str = "240"
+    timeframe3Enabled: bool = False
+    timeframe3: str = "30"
+    showBreaks: bool = True
+    showRetests: bool = True
+    avoidFalseBreaks: bool = True
+    falseBreakoutVolumeThresholdOpt: float = 0.3
+    inverseBrokenLineColor: bool = True
+    lineStyle_: str = "...."
+    lineWidth: int = 1
+    supportColor: str = "#08998180"
+    resistanceColor: str = "#f2364580"
+    textColor: str = "#11101051"
+    labelsize: str = "Small"
+    labelsAlign: str = "Right"
+    enableRetestAlerts: bool = True
+    enableBreakAlerts: bool = True
+    memoryOptimizatonEnabled: bool = True
+    debug_labelPivots: str = "None"
+    debug_pivotLabelText: bool = False
+    debug_showBrokenOnLabel: bool = False
+    debug_removeDuplicateRS: bool = True
+    debug_lastXResistances: int = 3
+    debug_lastXSupports: int = 3
+    debug_enabledHistory: bool = True
+    debug_maxHistoryRecords: int = 10
+
+
+@dataclass
+class ImmediateAlertInputs:
+    """Controls for immediate cross-symbol event notifications."""
+
+    enable: bool = True
+    watch_idm_ob: bool = True
+    watch_ext_ob: bool = True
+    dedupe_minutes: int = 30
+    cache_file: str = "idm_ext_event_cache.json"
+
+
+@dataclass
+class ScannerRuntimeInputs:
+    """Scanner execution controls exposed with the indicator inputs."""
+
+    parallel_tasks: int = 6
+    transport: str = "rest"
+    mode: str = "stream"
+    poll_interval_seconds: float = 2.0
+    stream_duration_seconds: Optional[float] = None
+    max_cycles: Optional[int] = None
+    incremental_limit: int = 120
+
+
+@dataclass
+class IndicatorInputs:
+    pullback: PullbackInputs = field(default_factory=PullbackInputs)
+    structure: MarketStructureInputs = field(default_factory=MarketStructureInputs)
+    order_block: OrderBlockInputs = field(default_factory=OrderBlockInputs)
+    demand_supply: DemandSupplyInputs = field(default_factory=DemandSupplyInputs)
+    fvg: FVGInputs = field(default_factory=FVGInputs)
+    liquidity: LiquidityInputs = field(default_factory=LiquidityInputs)
+    order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
+    candle: CandleInputs = field(default_factory=CandleInputs)
+    console: ConsoleInputs = field(default_factory=ConsoleInputs)
+    logic_toggles: LogicToggleInputs = field(default_factory=LogicToggleInputs)
+    alerts: AlertLogicInputs = field(default_factory=AlertLogicInputs)
+    structure_util: StructureInputs = field(default_factory=StructureInputs)
+    ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
+    key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
+    sessions: SessionInputs = field(default_factory=SessionInputs)
+    swing_detection: SwingDetectionInputs = field(default_factory=SwingDetectionInputs)
+    zigzag: ZigZagInputs = field(default_factory=ZigZagInputs)
+    support_resistance: SupportResistanceInputs = field(default_factory=SupportResistanceInputs)
+    immediate_alerts: ImmediateAlertInputs = field(default_factory=ImmediateAlertInputs)
+    scanner_runtime: ScannerRuntimeInputs = field(default_factory=ScannerRuntimeInputs)
+
+
+# ----------------------------------------------------------------------------
+# Scanner, CLI, and automation defaults
+# ----------------------------------------------------------------------------
+
+
+_MEME_BASES = {
+    "DOGE",
+    "SHIB",
+    "PEPE",
+    "FLOKI",
+    "BONK",
+    "WIF",
+    "BABYDOGE",
+    "MOG",
+    "DEGEN",
+    "PONKE",
+    "BODEN",
+    "MEME",
+    "AIDOGE",
+    "MEOW",
+    "GME",
+    "TOSHI",
+    "HOPPY",
+    "KITTY",
+    "LADYS",
+    "CREAM",
+    "PIPI",
+    "JEET",
+    "CHILLGUY",
+    "HUAHUA",
+}
+
+_DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
+
+
+@dataclass(frozen=True)
+class _EditorAutorunDefaults:
+    timeframe: str = "1m"
+    candle_limit: int = 600
+    max_symbols: int = 60
+    recent_bars: int = 2
+
+
+EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
+
+
+@dataclass
+class _CLISettings:
+    # indicator toggles mirrored from the Pine port
+    showHL: bool = False
+    showMn: bool = False
+    showISOB: bool = True
+    showMajoinMiner: bool = False
+    showCircleHL: bool = True
+    showSMC: bool = True
+    lengSMC: int = 40
+    swing_size: int = 10
+    show_fvg: bool = True
+    show_liquidity: bool = True
+    liquidity_display_limit: int = 20
+    drop_last_incomplete: bool = False
+    # scanner controls
+    tg_enable: bool = False
+    tg_title_prefix: str = "SMC Alert"
+    # matching indicator behaviour
+    ob_test_mode: str = "CLOSE"
+    zone_type: str = "Mother Bar"
+    bos_confirmation: str = "Close"
+    strict_close_for_break: bool = False
+    # filters
+    market: str = "usdtm"
+    min_change: float = 5.0
+    min_volume: float = 30_000_000.0
+    max_scan: int = 60
+    allow_meme: bool = False
+    exclude_symbols: str = ""
+    exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
+    include_only: str = ""
+
+
+@dataclass
+class BinanceSymbolSelectorConfig:
+    """User-facing switches controlling Binance symbol prioritisation."""
+
+    prioritize_top_gainers: bool = True
+    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
+    top_gainer_threshold: float = 5.0
+    top_gainer_scope: str = "24h"
+
+
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
+
+
+# Console report labelling and ordering
+METRIC_LABELS = [
+    ("alerts", "عدد التنبيهات"),
+    ("pullback_arrows", "إشارات Pullback"),
+    ("choch_labels", "علامات CHoCH"),
+    ("bos_labels", "علامات BOS"),
+    ("idm_labels", "علامات IDM"),
+    ("demand_zones", "مناطق الطلب"),
+    ("supply_zones", "مناطق العرض"),
+    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
+    ("idm_ob_touched", "IDM OB تم ملامستها"),
+    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
+    ("ext_ob_touched", "EXT OB تم ملامستها"),
+    ("bullish_fvg", "فجوات FVG صاعدة"),
+    ("bearish_fvg", "فجوات FVG هابطة"),
+    ("order_flow_boxes", "صناديق Order Flow"),
+    ("liquidity_objects", "مستويات السيولة"),
+    ("scob_colored_bars", "شموع SCOB"),
+]
+
+
+EVENT_DISPLAY_ORDER = [
+    ("BOS", "BOS"),
+    ("BOS_PLUS", "BOS+"),
+    ("CHOCH", "CHOCH"),
+    ("MSS_PLUS", "MSS+"),
+    ("MSS", "MSS"),
+    ("IDM", "IDM"),
+    ("IDM_OB", "IDM OB"),
+    ("EXT_OB", "EXT OB"),
+    ("HIST_IDM_OB", "Hist IDM OB"),
+    ("HIST_EXT_OB", "Hist EXT OB"),
+    ("GOLDEN_ZONE", "Golden zone"),
+    ("X", "X"),
+    ("RED_CIRCLE", "الدوائر الحمراء"),
+    ("GREEN_CIRCLE", "الدوائر الخضراء"),
+    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
+    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
+]
+
+
+WATCH_EVENT_KEY_MAP: Dict[str, Tuple[str, ...]] = {
+    "IDM_OB": ("IDM_OB", "idm_ob", "IDM OB", "idm ob"),
+    "EXT_OB": ("EXT_OB", "ext_ob", "EXT OB", "ext ob"),
+}
+
+WATCH_EVENT_LABELS: Dict[str, str] = {
+    "IDM_OB": "IDM OB",
+    "EXT_OB": "EXT OB",
+}
+
+
+class ImmediateEventCache:
+    """Persistent store tracking the latest broadcast timestamp per symbol/event."""
+
+    def __init__(self, *, path: Optional[Path], dedupe_seconds: int) -> None:
+        self.path = path
+        self.dedupe_seconds = max(int(dedupe_seconds), 0)
+        self._data: Dict[str, Dict[str, int]] = {}
+        if self.path is not None:
+            self._load()
+
+    # ------------------------------------------------------------------
+    def _load(self) -> None:
+        try:
+            if not self.path or not self.path.exists():
+                return
+            with self.path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        for symbol, mapping in payload.items():
+            if not isinstance(symbol, str) or not isinstance(mapping, dict):
+                continue
+            clean: Dict[str, int] = {}
+            for event_key, timestamp in mapping.items():
+                if not isinstance(event_key, str):
+                    continue
+                try:
+                    clean[event_key] = int(timestamp)
+                except Exception:
+                    continue
+            if clean:
+                self._data[symbol] = clean
+
+    # ------------------------------------------------------------------
+    def save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    def register(self, symbol: str, event_key: str, timestamp: int) -> bool:
+        """Return True if the event is new and should be announced."""
+
+        if timestamp <= 0:
+            return False
+        symbol_key = symbol.upper()
+        cache = self._data.setdefault(symbol_key, {})
+        last_ts = cache.get(event_key)
+        if last_ts is not None:
+            if timestamp <= last_ts:
+                return False
+            if self.dedupe_seconds:
+                delta = timestamp - last_ts
+                if delta < self.dedupe_seconds * 1000:
+                    cache[event_key] = timestamp
+                    return False
+        cache[event_key] = timestamp
+        return True
+
+
+def _build_immediate_event_cache(
+    alert_inputs: Optional[ImmediateAlertInputs],
+) -> Optional[ImmediateEventCache]:
+    if alert_inputs is None or not getattr(alert_inputs, "enable", True):
+        return None
+    cache_file = getattr(alert_inputs, "cache_file", "")
+    path: Optional[Path]
+    if cache_file:
+        path = Path(cache_file).expanduser()
+    else:
+        path = None
+    dedupe_minutes = getattr(alert_inputs, "dedupe_minutes", 0) or 0
+    dedupe_seconds = max(int(dedupe_minutes) * 60, 0)
+    return ImmediateEventCache(path=path, dedupe_seconds=dedupe_seconds)
+
+
+def _event_timestamp_from_payload(payload: Any) -> Optional[int]:
+    if isinstance(payload, dict):
+        for key in ("time", "ts", "timestamp"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)):
+                ts_val = int(value)
+                if ts_val > 0:
+                    return ts_val
+    if isinstance(payload, (list, tuple)) and payload:
+        candidate = payload[-1]
+        if isinstance(candidate, (int, float)):
+            ts_val = int(candidate)
+            if ts_val > 0:
+                return ts_val
+    return None
+
+
+def _event_direction_from_payload(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict):
+        for key in ("direction", "direction_display", "status"):
+            direction = payload.get(key)
+            normalized = _normalize_direction(direction)
+            if normalized:
+                return normalized
+    return None
+
+
+def _event_display_from_payload(payload: Any) -> str:
+    display = None
+    if isinstance(payload, dict):
+        display = payload.get("display") or payload.get("text") or payload.get("title")
+        status_display = payload.get("status_display")
+        if not display:
+            price = payload.get("price")
+            if isinstance(price, (list, tuple)) and price:
+                display = " → ".join(format_price(p) for p in price)
+            elif isinstance(price, (int, float)):
+                display = format_price(price)
+        if status_display and display:
+            display = f"{display} [{status_display}]"
+    if isinstance(display, str) and display.strip():
+        return display
+    return "—"
+
+
+def _event_price_payload(payload: Any) -> Optional[Union[float, Tuple[float, float]]]:
+    if isinstance(payload, dict):
+        price = payload.get("price")
+        if isinstance(price, (int, float)):
+            return float(price)
+        if isinstance(price, (list, tuple)) and len(price) == 2:
+            try:
+                return float(price[0]), float(price[1])
+            except (TypeError, ValueError):
+                return None
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None
+        if isinstance(metadata, dict):
+            zone_meta = metadata.get("zone")
+            if isinstance(zone_meta, dict):
+                rng = zone_meta.get("range")
+                if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                    try:
+                        return float(rng[0]), float(rng[1])
+                    except (TypeError, ValueError):
+                        return None
+    return None
+
+
+def _format_immediate_event_message(event: Dict[str, Any]) -> str:
+    label = event.get("event_label") or event.get("event_key") or ""
+    message = (
+        f"تنبيه فوري: {ANSI_BOLD}{_format_symbol(event.get('symbol', ''))}{ANSI_RESET}"
+        f" ({event.get('timeframe', '')}) - {label}: {event.get('display', '')}"
+    )
+    time_display = event.get("time_display")
+    if time_display and time_display != "—":
+        message += f" | {time_display}"
+    return message
+
+
+def _collect_immediate_events(
+    symbol: str,
+    timeframe: str,
+    latest_events: Any,
+    runtime: SmartMoneyAlgoProE5,
+    cache: Optional[ImmediateEventCache],
+    alert_inputs: Optional[ImmediateAlertInputs],
+    event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> List[Dict[str, Any]]:
+    if cache is None or alert_inputs is None or not getattr(alert_inputs, "enable", True):
+        return []
+
+    watch_keys: List[str] = []
+    if getattr(alert_inputs, "watch_idm_ob", True):
+        watch_keys.append("IDM_OB")
+    if getattr(alert_inputs, "watch_ext_ob", True):
+        watch_keys.append("EXT_OB")
+    if not watch_keys or not isinstance(latest_events, dict):
+        return []
+
+    events: List[Dict[str, Any]] = []
+    for key in watch_keys:
+        variants = WATCH_EVENT_KEY_MAP.get(key, (key,))
+        payload: Any = None
+        for variant in variants:
+            candidate = latest_events.get(variant)
+            if candidate is not None:
+                payload = candidate
+                break
+            candidate = _ci_get(latest_events, variant)
+            if candidate is not None:
+                payload = candidate
+                break
+        if payload is None:
+            continue
+        timestamp = _event_timestamp_from_payload(payload)
+        if timestamp is None:
+            continue
+        if not cache.register(symbol, key, timestamp):
+            continue
+        direction = _event_direction_from_payload(payload)
+        display = _event_display_from_payload(payload)
+        colored_display = _colorize_directional_text(display, direction=direction)
+        time_display = format_timestamp(timestamp)
+        price_payload = _event_price_payload(payload)
+        events.append(
+            {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "event_key": key,
+                "event_label": WATCH_EVENT_LABELS.get(key, key),
+                "timestamp": timestamp,
+                "time_display": time_display,
+                "display": display,
+                "display_colored": colored_display,
+                "direction": direction,
+                "price": price_payload,
+            }
+        )
+
+    for event in events:
+        if event_sink is not None:
+            event_sink(event)
+        else:
+            message = _format_immediate_event_message(event)
+            print(
+                _colorize_directional_text(message, direction=event.get("direction")),
+                flush=True,
+            )
+    return events
+
+
+def _smoke_test_immediate_alert_sink(
+    queue: "asyncio.Queue[Dict[str, Any]]",
+    sink: Callable[[Dict[str, Any]], None],
+) -> None:
+    """Ensure the alert sink enqueues events before the scanner starts."""
+
+    probe = {
+        "symbol": "_SELF_TEST_",
+        "timeframe": "-",
+        "event_key": "PROBE",
+        "event_label": "Probe",
+        "display": "probe event",
+        "time_display": "—",
+        "direction": None,
+    }
+    size_before = queue.qsize()
+    sink(probe)
+    if queue.qsize() <= size_before:
+        raise RuntimeError("Immediate alert sink did not enqueue probe event")
+    try:
+        queue.get_nowait()
+    except asyncio.QueueEmpty:  # pragma: no cover - defensive
+        return
+    queue.task_done()
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -700,394 +1566,6 @@ class Box:
         return self.right
 
 
-# ----------------------------------------------------------------------------
-# Indicator inputs (1:1 with Pine defaults for targeted packages)
-# ----------------------------------------------------------------------------
-
-
-@dataclass
-class PullbackInputs:
-    showHL: bool = False
-    colorHL: str = "#000000"
-    showMn: bool = False
-
-
-@dataclass
-class MarketStructureInputs:
-    showSMC: bool = True
-    lengSMC: int = 40
-    colorIDM: str = "color.rgb(0, 0, 0, 20)"
-    structure_type: str = "Choch with IDM"
-    showCircleHL: bool = True
-    bull: str = "color.green"
-    bear: str = "color.red"
-
-
-@dataclass
-class OrderBlockInputs:
-    extndBox: bool = True
-    showExob: bool = True
-    showIdmob: bool = True
-    showBrkob: bool = True
-    txtsiz: str = "size.auto"
-    clrtxtextbullbg: str = "color.rgb(76, 175, 79, 86)"
-    clrtxtextbearbg: str = "color.rgb(255, 82, 82, 83)"
-    clrtxtextbulliembg: str = "color.rgb(76, 175, 79, 86)"
-    clrtxtextbeariembg: str = "color.rgb(255, 82, 82, 86)"
-    clrtxtextbull: str = "color.green"
-    clrtxtextbear: str = "color.red"
-    clrtxtextbulliem: str = "color.green"
-    clrtxtextbeariem: str = "color.red"
-    showPOI: bool = True
-    poi_type: str = "Mother Bar"
-    colorSupply: str = "#cd5c4800"
-    colorDemand: str = "#2f825f00"
-    colorMitigated: str = "#c0c0c000"
-    showSCOB: bool = True
-    scobUp: str = "#0b3ff9"
-    scobDn: str = "#da781d"
-
-
-@dataclass
-class DemandSupplyInputs:
-    show_order_blocks: bool = False
-    ibull_ob_css: str = "#5f6b5d19"
-    ibear_ob_css: str = "#ef3a3a19"
-    ob_type__: str = "All"
-    i_tf_ob: str = ""
-    mittigation_filt: str = "wick"
-    overlapping_filt: bool = True
-    max_obs: int = 8
-    length_extend_ob: int = 20
-    ob_extend: bool = False
-    text_size_ob_: str = "size.normal"
-    ob_text_color_1: str = "color.new(#787b86, 0)"
-    volume_text: bool = False
-    percent_text: bool = False
-    show_line_ob_1: bool = False
-    line_style_ob_1: str = "line.style_solid"
-    show_order_blocks_mtf: bool = False
-    ibull_ob_css_2: str = "color.new(#5d606b, 25)"
-    ibear_ob_css_2: str = "color.new(#5d606b, 25)"
-    ob_type__mtf: str = "All"
-    i_tf_ob_mtf: str = "240"
-    mittigation_filt_mtf: str = "Wicks"
-    overlapping_filt_mtf: bool = True
-    max_obs_mtf: int = 4
-    length_extend_ob_mtf: int = 20
-    ob_extend_mtf: bool = False
-    text_size_ob_2: str = "size.small"
-    ob_text_color_2: str = "color.new(#787b86, 0)"
-    volume_text_2: bool = False
-    percent_text_2: bool = False
-    show_line_ob_2: bool = False
-    line_style_ob_2: str = "line.style_solid"
-    v_buy: str = "#00dbff4d"
-    v_sell: str = "#e91e634d"
-    ob_showlast: int = 5
-    iob_showlast: int = 5
-    max_width_ob: float = 3.0
-    style: str = "Colored"
-    v_lookback: int = 10
-    ob_loockback: int = 10
-
-
-@dataclass
-class FVGInputs:
-    show_fvg: bool = False
-    i_tf: str = ""
-    i_mtf: str = "HTF"
-    i_bullishfvgcolor: str = "color.new(color.green,100)"
-    i_bearishfvgcolor: str = "color.new(color.green,90)"
-    remove_small: bool = True
-    mittigation_filt_fvg: str = "Touch"
-    fvg_color_fill: bool = True
-    fvg_shade_fill: bool = False
-    max_fvg: int = 8
-    length_extend: int = 20
-    fvg_extend: bool = False
-    fvg_extend_B: bool = True
-    i_fillByMid: bool = True
-    i_deleteonfill: bool = True
-    i_textColor: str = "color.white"
-    i_tfos: int = 10
-    i_mtfos: int = 50
-    max_width_fvg: float = 1.5
-    i_mtfbearishfvgcolor: str = "color.yellow"
-    i_mtfbullishfvgcolor: str = "color.yellow"
-    mid_style: str = "Solid"
-    i_midPointColor: str = "color.rgb(249, 250, 253, 99)"
-
-
-@dataclass
-class LiquidityInputs:
-    currentTF: bool = False
-    displayLimit: int = 20
-    lowLineColorHTF: str = "#00bbf94d"
-    highLineColorHTF: str = "#e91e624d"
-    htfTF: str = ""
-    _candleType: str = "Close"
-    leftBars: int = 20
-    mitiOptions: str = "Remove"
-    length_extend_liq: int = 20
-    extentionMax: bool = False
-    _highLineStyleHTF: str = "Solid"
-    box_width: float = 2.5
-    lineWidthHTF: int = 2
-    liquidity_text_color: str = "color.black"
-    highBoxBorderColorHTF: str = "color.new(#e91e624d,90)"
-    lowBoxBorderColorHTF: str = "color.new(#00bbf94d,90)"
-    displayStyle_liq: str = "Boxes"
-
-
-@dataclass
-class OrderFlowInputs:
-    showMajoinMiner: bool = False
-    showISOB: bool = True
-    showMajoinMinerMax: int = 10
-    showISOBMax: int = 10
-    showTsted: bool = False
-    maxTested: int = 20
-    ClrMajorOFBull: str = "color.rgb(33, 149, 243, 71)"
-    ClrMajorOFBear: str = "color.rgb(33, 149, 243, 72)"
-    ClrMinorOFBull: str = "color.rgb(155, 39, 176, 81)"
-    ClrMinorOFBear: str = "color.rgb(155, 39, 176, 86)"
-    clrObBBTated: str = "color.rgb(136, 142, 252, 86)"
-
-
-@dataclass
-class CandleInputs:
-    showISB: bool = False
-    colorOSB_up: str = "#0b3ff9"
-    showOSB: bool = False
-    colorOSB_down: str = "#da781d"
-    colorISB: str = "color.rgb(187, 6, 247, 77)"
-    label_color_bearish: str = "color.rgb(255, 82, 82, 90)"
-    label_color_bullish: str = "color.rgb(33, 149, 243, 90)"
-    trendRule: str = "SMA50"
-
-
-@dataclass
-class ConsoleInputs:
-    max_age_bars: int = 1
-
-
-@dataclass
-class StructureInputs:
-    isOTE: bool = False
-    ote1: float = 0.78
-    ote2: float = 0.61
-    oteclr: str = "#ff95002b"
-    sizGd: str = "size.normal"
-    showPdh: bool = False
-    lengPdh: int = 40
-    showPdl: bool = False
-    lengPdl: int = 40
-    showMid: bool = True
-    lengMid: int = 40
-    showSw: bool = True
-    markX: bool = False
-    colorSweep: str = "color.gray"
-    showTP: bool = False
-
-
-@dataclass
-class ICTMarketStructureInputs:
-    showms: bool = False
-    bosColor1: str = "color.green"
-    bosColor2: str = "color.red"
-    ms_type: str = "All"
-    show_equal_highlow: bool = False
-    eq_bear_color: str = "#787b86"
-    eq_bull_color: str = "#787b86"
-    eq_threshold: float = 0.3
-    label_sizes_s: str = "Medium"
-    swingSize: int = 10
-    showSwing: bool = False
-
-
-@dataclass
-class KeyLevelsInputs:
-    Show_4H_Levels: bool = False
-    Color_4H_Levels: str = "color.orange"
-    Style_4H_Levels: str = "Dotted"
-    Text_4H_Levels: bool = True
-    Show_Daily_Levels: bool = False
-    Color_Daily_Levels: str = "#08bcd4"
-    Style_Daily_Levels: str = "Dotted"
-    Text_Daily_Levels: bool = True
-    Show_Monday_Levels: bool = False
-    Color_Monday_Levels: str = "color.white"
-    Style_Monday_Levels: str = "Dotted"
-    Text_Monday_Levels: bool = True
-    Show_Weekly_Levels: bool = False
-    WeeklyColor: str = "#fffcbc"
-    Weekly_style: str = "Dotted"
-    WeeklyTextType: bool = True
-    Show_Monthly_Levels: bool = False
-    MonthlyColor: str = "#098c30"
-    Monthly_style: str = "Dotted"
-    MonthlyTextType: bool = True
-    Show_Quaterly_Levels: bool = False
-    quarterlyColor: str = "#bcffd0"
-    Quaterly_style: str = "Dotted"
-    QuarterlyTextType: bool = True
-    Show_Yearly_Levels: bool = False
-    YearlyColor: str = "#ffbcdb"
-    Yearly_style: str = "Dotted"
-    YearlyTextType: bool = True
-    labelsize: str = "Small"
-    displayStyle: str = "Standard"
-    distanceright: int = 25
-    radistance: int = 250
-    linesize: str = "Small"
-    linestyle: str = "Solid"
-
-
-@dataclass
-class SessionInputs:
-    is_londonrange_enabled: bool = False
-    london_OC: bool = True
-    london_HL: bool = True
-    is_usrange_enabled: bool = False
-    us_OC: bool = True
-    us_HL: bool = True
-    is_tokyorange_enabled: bool = False
-    asia_OC: bool = True
-    asia_HL: bool = True
-    SessionTextType: bool = False
-    Londont: str = "0800-1600"
-    USt: str = "1400-2100"
-    Asiat: str = "0000-0900"
-    LondonColor: str = "color.rgb(15, 13, 13)"
-    USColor: str = "color.rgb(190, 8, 236)"
-    AsiaColor: str = "color.rgb(33, 5, 241)"
-    Short_text_London: bool = True
-    Short_text_NY: bool = True
-    Short_text_TKY: bool = True
-
-
-@dataclass
-class SwingDetectionInputs:
-    cooldownPeriod: int = 10
-    showSwing_: bool = True
-    swingClr: str = "color.new(color.orange, 0)"
-    bullWidth: int = 1
-    bullStyle: str = "Dashed"
-    bullColor: str = "color.new(color.teal, 0)"
-    bearWidth: int = 1
-    bearStyle: str = "Dashed"
-    bearColor: str = "color.new(color.maroon, 0)"
-    display_third: bool = False
-    length3: int = 20
-    mult: float = 1.0
-    atr_Len: int = 500
-    upCss: str = "#089981"
-    dnCss: str = "#f23645"
-    unbrokenCss: str = "#2157f3"
-
-
-@dataclass
-class ZigZagInputs:
-    length1: int = 100
-    extend: bool = True
-    show_ext: bool = True
-    show_labels: bool = True
-    upcol: str = "#ff1100"
-    midcol: str = "#ff5d00"
-    dncol: str = "#2157f3"
-
-
-@dataclass
-class SupportResistanceInputs:
-    resistanceSupportCount: int = 3
-    pivotRange: int = 15
-    strength: int = 1
-    expandLines: bool = True
-    enableZones: bool = False
-    zoneWidthType: str = "Dynamic"
-    zoneWidth: int = 1
-    timeframe1Enabled: bool = True
-    timeframe1_: str = ""
-    timeframe2Enabled: bool = True
-    timeframe2: str = "240"
-    timeframe3Enabled: bool = False
-    timeframe3: str = "30"
-    showBreaks: bool = True
-    showRetests: bool = True
-    avoidFalseBreaks: bool = True
-    falseBreakoutVolumeThresholdOpt: float = 0.3
-    inverseBrokenLineColor: bool = True
-    lineStyle_: str = "...."
-    lineWidth: int = 1
-    supportColor: str = "#08998180"
-    resistanceColor: str = "#f2364580"
-    textColor: str = "#11101051"
-    labelsize: str = "Small"
-    labelsAlign: str = "Right"
-    enableRetestAlerts: bool = True
-    enableBreakAlerts: bool = True
-    memoryOptimizatonEnabled: bool = True
-    debug_labelPivots: str = "None"
-    debug_pivotLabelText: bool = False
-    debug_showBrokenOnLabel: bool = False
-    debug_removeDuplicateRS: bool = True
-    debug_lastXResistances: int = 3
-    debug_lastXSupports: int = 3
-    debug_enabledHistory: bool = True
-    debug_maxHistoryRecords: int = 10
-
-
-@dataclass
-class CustomPoint:
-    time: int
-    price: float
-    tr: float
-
-
-@dataclass
-class SupportResistanceLevel:
-    rs_type: str
-    timeframe: str
-    price: float
-    points: List[CustomPoint] = field(default_factory=list)
-    line: Optional[Line] = None
-    box: Optional[Box] = None
-    price_label: Optional[Label] = None
-    break_label: Optional[Label] = None
-    break_line: Optional[Line] = None
-    break_box: Optional[Box] = None
-    retest_labels: List[Label] = field(default_factory=list)
-    is_broken: bool = False
-    broken_time: Optional[int] = None
-    break_level: Optional[float] = None
-    break_tr: float = 0.0
-    last_retest_time: Optional[int] = None
-    last_retest_bar: Optional[int] = None
-    last_break_alert_time: Optional[int] = None
-    last_retest_alert_time: Optional[int] = None
-
-
-@dataclass
-class IndicatorInputs:
-    pullback: PullbackInputs = field(default_factory=PullbackInputs)
-    structure: MarketStructureInputs = field(default_factory=MarketStructureInputs)
-    order_block: OrderBlockInputs = field(default_factory=OrderBlockInputs)
-    demand_supply: DemandSupplyInputs = field(default_factory=DemandSupplyInputs)
-    fvg: FVGInputs = field(default_factory=FVGInputs)
-    liquidity: LiquidityInputs = field(default_factory=LiquidityInputs)
-    order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
-    candle: CandleInputs = field(default_factory=CandleInputs)
-    console: ConsoleInputs = field(default_factory=ConsoleInputs)
-    structure_util: StructureInputs = field(default_factory=StructureInputs)
-    ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
-    key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
-    sessions: SessionInputs = field(default_factory=SessionInputs)
-    swing_detection: SwingDetectionInputs = field(default_factory=SwingDetectionInputs)
-    zigzag: ZigZagInputs = field(default_factory=ZigZagInputs)
-    support_resistance: SupportResistanceInputs = field(default_factory=SupportResistanceInputs)
-
-
 @dataclass
 class PullbackInventory:
     general_info: List[str] = field(default_factory=list)
@@ -1150,6 +1628,57 @@ class SeriesAccessor:
 # ----------------------------------------------------------------------------
 # request.security emulation helpers
 # ----------------------------------------------------------------------------
+
+
+def _normalise_candle(entry: Any) -> Optional[Dict[str, float]]:
+    """Convert raw OHLCV entries into the internal dictionary representation."""
+
+    if isinstance(entry, dict):
+        try:
+            time_val = int(float(entry["time"]))
+            open_val = float(entry["open"])
+            high_val = float(entry["high"])
+            low_val = float(entry["low"])
+            close_val = float(entry["close"])
+            volume_raw = entry.get("volume", NA)
+        except (KeyError, TypeError, ValueError):
+            return None
+        volume_val: float
+        try:
+            volume_val = float(volume_raw) if volume_raw is not None else NA
+        except (TypeError, ValueError):
+            volume_val = NA
+        return {
+            "time": time_val,
+            "open": open_val,
+            "high": high_val,
+            "low": low_val,
+            "close": close_val,
+            "volume": volume_val,
+        }
+
+    if isinstance(entry, (list, tuple)):
+        if len(entry) < 5:
+            return None
+        try:
+            time_val = int(float(entry[0]))
+            open_val = float(entry[1])
+            high_val = float(entry[2])
+            low_val = float(entry[3])
+            close_val = float(entry[4])
+            volume_val = float(entry[5]) if len(entry) > 5 and entry[5] is not None else NA
+        except (TypeError, ValueError):
+            return None
+        return {
+            "time": time_val,
+            "open": open_val,
+            "high": high_val,
+            "low": low_val,
+            "close": close_val,
+            "volume": volume_val,
+        }
+
+    return None
 
 
 def _parse_timeframe_to_seconds(timeframe: str, base_seconds: Optional[int]) -> Optional[int]:
@@ -1292,6 +1821,7 @@ class SmartMoneyAlgoProE5:
     PDH_TEXT = "PDH"
     PDL_TEXT = "PDL"
     MID_TEXT = "0.5"
+    CHOCH_CORRECTION_ALERT_TITLE = "CHOCH Correction Alert"
 
     def __init__(
         self,
@@ -1319,13 +1849,55 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = 1
+            max_age = 0
         else:
             try:
-                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
+                raw_value = getattr(console_inputs, "max_age_bars", 0)
+            except AttributeError:
+                raw_value = 0
+            try:
+                max_age = int(raw_value)
             except (TypeError, ValueError):
-                max_age = 1
-        self.console_max_age_bars = max(1, max_age)
+                max_age = 0
+        self.console_max_age_bars = max(0, max_age)
+
+        alert_inputs = getattr(self.inputs, "alerts", AlertLogicInputs())
+        if isinstance(alert_inputs, AlertLogicInputs):
+            self.alert_inputs = alert_inputs
+        else:
+            alert_kwargs: Dict[str, Any] = {}
+            if isinstance(alert_inputs, dict):
+                source_dict = alert_inputs
+            else:
+                source_dict = {}
+            for field in dataclasses.fields(AlertLogicInputs):
+                if isinstance(source_dict, dict) and field.name in source_dict:
+                    alert_kwargs[field.name] = source_dict[field.name]
+                else:
+                    value = getattr(alert_inputs, field.name, dataclasses.MISSING)
+                    if value is not dataclasses.MISSING:
+                        alert_kwargs[field.name] = value
+            self.alert_inputs = AlertLogicInputs(**alert_kwargs)
+
+        logic_inputs = getattr(self.inputs, "logic_toggles", LogicToggleInputs())
+        if isinstance(logic_inputs, LogicToggleInputs):
+            self.logic_toggles = logic_inputs
+        else:
+            logic_kwargs: Dict[str, Any] = {}
+            if isinstance(logic_inputs, dict):
+                logic_source = logic_inputs
+            else:
+                logic_source = {}
+            for field in dataclasses.fields(LogicToggleInputs):
+                if isinstance(logic_source, dict) and field.name in logic_source:
+                    logic_kwargs[field.name] = logic_source[field.name]
+                else:
+                    value = getattr(logic_inputs, field.name, dataclasses.MISSING)
+                    if value is not dataclasses.MISSING:
+                        logic_kwargs[field.name] = value
+            self.logic_toggles = LogicToggleInputs(**logic_kwargs)
+
+        self._apply_logic_toggles()
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1333,6 +1905,13 @@ class SmartMoneyAlgoProE5:
         self.swing_state = SwingStateMirror()
         self.order_block_state = OrderBlockStateMirror()
         self.scob_state = SCOBStateMirror()
+
+        # Alert orchestration -------------------------------------------------
+        self.last_choch_event: Optional[Dict[str, Any]] = None
+        self._last_choch_alert_time: Optional[int] = None
+        self._forced_alert_timestamp: Optional[int] = None
+        self._golden_zone_touch_state: Optional[str] = None
+        self._golden_zone_last_touch_time: Optional[int] = None
 
         # Pine condition mirroring -------------------------------------------
         self.condition_specs: Dict[str, ConditionSpec] = {}
@@ -1350,6 +1929,105 @@ class SmartMoneyAlgoProE5:
         self.last_liq_low_time: Optional[int] = None
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
+
+    def _logic_enabled(self, flag: str) -> bool:
+        toggles = getattr(self, "logic_toggles", None)
+        if not isinstance(toggles, LogicToggleInputs):
+            return True
+        value = getattr(toggles, flag, True)
+        try:
+            return bool(value)
+        except Exception:
+            return True
+
+    def _apply_logic_toggles(self) -> None:
+        toggles = getattr(self, "logic_toggles", LogicToggleInputs())
+
+        def disable(obj: Any, name: str, value: Any = False) -> None:
+            if hasattr(obj, name):
+                setattr(obj, name, value)
+
+        if not toggles.enable_pullback:
+            disable(self.inputs.pullback, "showHL")
+            disable(self.inputs.pullback, "showMn")
+
+        if not toggles.enable_market_structure:
+            disable(self.inputs.structure, "showSMC")
+            disable(self.inputs.structure, "showCircleHL")
+
+        if not toggles.enable_order_block:
+            disable(self.inputs.order_block, "extndBox")
+            disable(self.inputs.order_block, "showExob")
+            disable(self.inputs.order_block, "showIdmob")
+            disable(self.inputs.order_block, "showBrkob")
+            disable(self.inputs.order_block, "showPOI")
+            disable(self.inputs.order_block, "showSCOB")
+
+        if not toggles.enable_demand_supply:
+            disable(self.inputs.demand_supply, "show_order_blocks")
+            disable(self.inputs.demand_supply, "show_order_blocks_mtf")
+
+        if not toggles.enable_fvg:
+            disable(self.inputs.fvg, "show_fvg")
+
+        if not toggles.enable_liquidity:
+            disable(self.inputs.liquidity, "currentTF")
+
+        if not toggles.enable_order_flow:
+            disable(self.inputs.order_flow, "showMajoinMiner")
+            disable(self.inputs.order_flow, "showISOB")
+            disable(self.inputs.order_flow, "showTsted")
+
+        if not toggles.enable_candle_patterns:
+            disable(self.inputs.candle, "showISB")
+            disable(self.inputs.candle, "showOSB")
+
+        if not toggles.enable_structure_util:
+            disable(self.inputs.structure_util, "showSw")
+            disable(self.inputs.structure_util, "showPdh")
+            disable(self.inputs.structure_util, "showPdl")
+            disable(self.inputs.structure_util, "showMid")
+            disable(self.inputs.structure_util, "isOTE")
+            disable(self.inputs.structure_util, "showTP")
+
+        if not toggles.enable_ict_structure:
+            disable(self.inputs.ict_structure, "showms")
+            disable(self.inputs.ict_structure, "show_equal_highlow")
+
+        if not toggles.enable_key_levels:
+            for attr in (
+                "Show_4H_Levels",
+                "Show_Daily_Levels",
+                "Show_Monday_Levels",
+                "Show_Weekly_Levels",
+                "Show_Monthly_Levels",
+                "Show_Quaterly_Levels",
+                "Show_Yearly_Levels",
+            ):
+                disable(self.inputs.key_levels, attr)
+
+        if not toggles.enable_sessions:
+            disable(self.inputs.sessions, "is_londonrange_enabled")
+            disable(self.inputs.sessions, "is_usrange_enabled")
+            disable(self.inputs.sessions, "is_tokyorange_enabled")
+
+        if not toggles.enable_swing_detection:
+            disable(self.inputs.swing_detection, "showSwing_")
+            disable(self.inputs.swing_detection, "display_third")
+
+        if not toggles.enable_zigzag:
+            disable(self.inputs.zigzag, "show_ext")
+            disable(self.inputs.zigzag, "show_labels")
+
+        if not toggles.enable_support_resistance:
+            disable(self.inputs.support_resistance, "timeframe1Enabled")
+            disable(self.inputs.support_resistance, "timeframe2Enabled")
+            disable(self.inputs.support_resistance, "timeframe3Enabled")
+            disable(self.inputs.support_resistance, "enableZones")
+            disable(self.inputs.support_resistance, "showBreaks")
+            disable(self.inputs.support_resistance, "showRetests")
+            disable(self.inputs.support_resistance, "enableRetestAlerts")
+            disable(self.inputs.support_resistance, "enableBreakAlerts")
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -1414,17 +2092,34 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if condition:
-            timestamp = self.series.get_time(0)
-            text = title if message is None else f"{title} :: {message}"
-            self.alerts.append((timestamp, text))
-            self._trace(
-                "alertcondition",
-                "trigger",
-                timestamp=timestamp,
-                title=title,
-                alert_message=message,
-            )
+        settings = getattr(self, "alert_inputs", AlertLogicInputs())
+        if not getattr(settings, "enable_all_alerts", True):
+            self._forced_alert_timestamp = None
+            return
+        if not condition:
+            self._forced_alert_timestamp = None
+            return
+        if title != self.CHOCH_CORRECTION_ALERT_TITLE:
+            self._forced_alert_timestamp = None
+            return
+        if not getattr(settings, "enable_choch_correction_alert", True):
+            self._forced_alert_timestamp = None
+            return
+        timestamp = (
+            self._forced_alert_timestamp
+            if isinstance(self._forced_alert_timestamp, int)
+            else self.series.get_time(0)
+        )
+        text = title if message is None else f"{title} :: {message}"
+        self.alerts.append((timestamp, text))
+        self._trace(
+            "alertcondition",
+            "trigger",
+            timestamp=timestamp,
+            title=title,
+            alert_message=message,
+        )
+        self._forced_alert_timestamp = None
 
     def _eval_condition(
         self,
@@ -1590,7 +2285,7 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
-        self.console_event_log[key] = {
+        record = {
             "text": key,
             "price": price,
             "time": timestamp,
@@ -1600,6 +2295,10 @@ class SmartMoneyAlgoProE5:
             "direction_display": direction_text,
             "source": "confirmed",
         }
+        self.console_event_log[key] = record
+        if key == "CHOCH":
+            self.last_choch_event = record
+            self._last_choch_alert_time = None
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -1620,6 +2319,18 @@ class SmartMoneyAlgoProE5:
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
+            if key == "GOLDEN_ZONE":
+                if status_key == "new":
+                    self._golden_zone_touch_state = "new"
+                    self._golden_zone_last_touch_time = None
+                elif status_key == "archived":
+                    self._golden_zone_touch_state = None
+                    self._golden_zone_last_touch_time = None
+                elif status_key in {"touched", "retest"}:
+                    self._golden_zone_touch_state = "touched"
+                    self._golden_zone_last_touch_time = ts
+            if status_key in {"touched", "retest"}:
+                self._handle_zone_correction_alert(key, ts)
             self.console_event_log[key] = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
@@ -1639,6 +2350,50 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
+
+    def _handle_zone_correction_alert(self, zone_key: str, event_time: int) -> None:
+        settings = getattr(self, "alert_inputs", AlertLogicInputs())
+        if not getattr(settings, "enable_all_alerts", True):
+            return
+        if not getattr(settings, "enable_choch_correction_alert", True):
+            return
+        if zone_key not in {"IDM_OB", "EXT_OB", "GOLDEN_ZONE"}:
+            return
+        if not self.last_choch_event:
+            return
+        choch_time = self.last_choch_event.get("time")
+        if not isinstance(choch_time, int):
+            return
+        if event_time <= choch_time:
+            return
+        if self._last_choch_alert_time == choch_time:
+            return
+        zone_flag_map = {
+            "IDM_OB": "enable_idm_ob_retest_alert",
+            "EXT_OB": "enable_ext_ob_retest_alert",
+            "GOLDEN_ZONE": "enable_golden_zone_retest_alert",
+        }
+        setting_name = zone_flag_map.get(zone_key)
+        if setting_name and not getattr(settings, setting_name, True):
+            return
+        zone_names = {
+            "IDM_OB": "IDM OB",
+            "EXT_OB": "EXT OB",
+            "GOLDEN_ZONE": "Golden zone",
+        }
+        direction_display = self.last_choch_event.get("direction_display")
+        choch_price = self.last_choch_event.get("price")
+        message_parts = ["تم التصحيح إلى منطقة", zone_names.get(zone_key, zone_key), "بعد CHOCH"]
+        if isinstance(direction_display, str) and direction_display:
+            message_parts.append(direction_display)
+        if isinstance(choch_price, (int, float)):
+            price_value = float(choch_price)
+            if not math.isnan(price_value):
+                message_parts.append(f"عند {format_price(price_value)}")
+        message = " ".join(message_parts)
+        self._forced_alert_timestamp = event_time
+        self.alertcondition(True, self.CHOCH_CORRECTION_ALERT_TITLE, message)
+        self._last_choch_alert_time = choch_time
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -2049,9 +2804,12 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     # Indicator execution
     # ------------------------------------------------------------------
-    def process(self, candles: Sequence[Dict[str, float]]) -> None:
+    def process(self, candles: Sequence[Any]) -> None:
         self.condition_trace.clear()
-        for candle in candles:
+        for entry in candles:
+            candle = _normalise_candle(entry)
+            if candle is None:
+                continue
             self.series.append(candle)
             self._trace(
                 "process",
@@ -5669,11 +6427,21 @@ class SmartMoneyAlgoProE5:
                 if line_obj in self.lines:
                     self.lines.remove(line_obj)
 
-    def removeZone(self, zoneArray: PineArray, zone: Box, zoneArrayisMit: PineArray, isBull: bool) -> None:
+    def removeZone(
+        self,
+        zoneArray: PineArray,
+        zone: Box,
+        zoneArrayisMit: PineArray,
+        isBull: bool,
+        *,
+        force_remove: bool = False,
+    ) -> None:
         index = zoneArray.indexof(zone)
         if index == -1:
             return
-        if not self.inputs.order_block.showBrkob:
+        if zone.text.strip() in {"IDM OB", "EXT OB"}:
+            self._register_box_event(zone, status="archived", event_time=self.series.get_time())
+        if force_remove or not self.inputs.order_block.showBrkob:
             if zone in self.boxes:
                 self.boxes.remove(zone)
         else:
@@ -6177,7 +6945,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
+                    self.removeZone(
+                        self.demandZone,
+                        self.demandZone.get(idx),
+                        self.demandZoneIsMit,
+                        True,
+                        force_remove=True,
+                    )
                 lstBx_ = self.demandZone.get(idx) if idx != -1 else None
         else:
             idx = -1
@@ -6203,7 +6977,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
+                    self.removeZone(
+                        self.supplyZone,
+                        self.supplyZone.get(idx),
+                        self.supplyZoneIsMit,
+                        False,
+                        force_remove=True,
+                    )
                 lstBx_ = self.supplyZone.get(idx) if idx != -1 else None
 
         colorText = (
@@ -6233,6 +7013,8 @@ class SmartMoneyAlgoProE5:
         return lstBx_
 
     def drawStructure(self, name: str, trend: bool) -> Tuple[float, Optional[Box]]:
+        if not self._logic_enabled("enable_market_structure"):
+            return self.lstHlPrs, None
         x, y = self.getDirection(trend, self.lastHBar, self.lastLBar, self.lastH, self.lastL)
         lstBx_: Optional[Box] = None
         if trend:
@@ -6260,7 +7042,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
+                    self.removeZone(
+                        self.demandZone,
+                        self.demandZone.get(idx),
+                        self.demandZoneIsMit,
+                        True,
+                        force_remove=True,
+                    )
         else:
             idx = -1
             lstPrs = None
@@ -6286,7 +7074,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
+                    self.removeZone(
+                        self.supplyZone,
+                        self.supplyZone.get(idx),
+                        self.supplyZoneIsMit,
+                        False,
+                        force_remove=True,
+                    )
         color = self.inputs.structure.bull if trend else self.inputs.structure.bear
         event_time = self.series.get_time()
         if not math.isnan(y):
@@ -6557,7 +7351,7 @@ class SmartMoneyAlgoProE5:
                 top = max(top, topZone)
                 bot = min(bot, botZone)
                 left = leftZone
-                self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
+                self.removeZone(zoneArray, zone, zoneArrayisMit, isBull, force_remove=True)
         box_obj = self.createBox(
             left,
             self.series.get_time(),
@@ -6570,6 +7364,8 @@ class SmartMoneyAlgoProE5:
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
+        if not self._logic_enabled("enable_order_block"):
+            return False
         isAlertextidm = False
         if zones.size() == 0:
             return False
@@ -6634,12 +7430,19 @@ class SmartMoneyAlgoProE5:
                 if self.inputs.order_block.showBrkob:
                     zones.remove(i)
                     zonesmit.remove(i)
-            elif (
-                (self.series.get_time() - leftZone > self.len * self.maxBarHistory)
-                or (isSupply and self.series.get("high") >= topZone)
-                or ((not isSupply) and self.series.get("low") <= botZone)
-            ):
-                self.removeZone(zones, zone, zonesmit, not isSupply)
+            else:
+                expired = self.series.get_time() - leftZone > self.len * self.maxBarHistory
+                blown = (isSupply and self.series.get("high") >= topZone) or (
+                    (not isSupply) and self.series.get("low") <= botZone
+                )
+                if expired or blown:
+                    self.removeZone(
+                        zones,
+                        zone,
+                        zonesmit,
+                        not isSupply,
+                        force_remove=expired,
+                    )
             i -= 1
         return isAlertextidm
 
@@ -6670,11 +7473,16 @@ class SmartMoneyAlgoProE5:
         if math.isnan(self.htfL) or close < self.htfL:
             self.htfL = close
 
-        self._update_daily_levels(high, low, time_val)
-        self._update_ict_market_structure(high, low, close)
-        self._update_key_levels(open_, high, low)
-        self._update_support_resistance(open_, high, low, close, volume)
-        self._update_sessions(open_, high, low, time_val)
+        if self._logic_enabled("enable_structure_util"):
+            self._update_daily_levels(high, low, time_val)
+        if self._logic_enabled("enable_ict_structure"):
+            self._update_ict_market_structure(high, low, close)
+        if self._logic_enabled("enable_key_levels"):
+            self._update_key_levels(open_, high, low)
+        if self._logic_enabled("enable_support_resistance"):
+            self._update_support_resistance(open_, high, low, close, volume)
+        if self._logic_enabled("enable_sessions"):
+            self._update_sessions(open_, high, low, time_val)
         self._trace("update_bar", "post_core", timestamp=time_val)
 
         if self.inputs.order_block.extndBox:
@@ -7067,69 +7875,76 @@ class SmartMoneyAlgoProE5:
             self.lastLBar = time_val
 
         # Order flow updates -------------------------------------------------
-        self._update_demand_supply_zones()
-        self._update_fvg()
-        self._update_liquidity()
-        self._update_swing_detection()
-        self._update_candlestick_patterns()
+        if self._logic_enabled("enable_demand_supply"):
+            self._update_demand_supply_zones()
+        if self._logic_enabled("enable_fvg"):
+            self._update_fvg()
+        if self._logic_enabled("enable_liquidity"):
+            self._update_liquidity()
+        if self._logic_enabled("enable_swing_detection"):
+            self._update_swing_detection()
+        if self._logic_enabled("enable_candle_patterns"):
+            self._update_candlestick_patterns()
         self.prev_close = close
 
-        alertBullOfMajor, alertBearOfMajor = self.getProcess(
-            self.arrOBBullm, self.arrOBBearm, self.arrOBBullisVm, self.arrOBBearisVm
-        )
-        alertBullOfMinor, alertBearOfMinor = self.getProcess(
-            self.arrOBBulls, self.arrOBBears, self.arrOBBullisVs, self.arrOBBearisVs
-        )
-        self.alertcondition(alertBullOfMajor, "Major Bullish order flow", "Major Bullish order flow")
-        self.alertcondition(alertBearOfMajor, "Major Bearish order flow", "Major Bearish order flow")
-        self.alertcondition(alertBullOfMinor, "Minor Bullish order flow", "Minor Bullish order flow")
-        self.alertcondition(alertBearOfMinor, "Minor Bearish order flow", "Minor Bearish order flow")
+        if self._logic_enabled("enable_order_flow"):
+            alertBullOfMajor, alertBearOfMajor = self.getProcess(
+                self.arrOBBullm, self.arrOBBearm, self.arrOBBullisVm, self.arrOBBearisVm
+            )
+            alertBullOfMinor, alertBearOfMinor = self.getProcess(
+                self.arrOBBulls, self.arrOBBears, self.arrOBBullisVs, self.arrOBBearisVs
+            )
+            self.alertcondition(alertBullOfMajor, "Major Bullish order flow", "Major Bullish order flow")
+            self.alertcondition(alertBearOfMajor, "Major Bearish order flow", "Major Bearish order flow")
+            self.alertcondition(alertBullOfMinor, "Minor Bullish order flow", "Minor Bullish order flow")
+            self.alertcondition(alertBearOfMinor, "Minor Bearish order flow", "Minor Bearish order flow")
 
         # Order block zone processing ---------------------------------------
-        isAlertextidmSell = self.processZones(self.supplyZone, True, self.supplyZoneIsMit)
-        isAlertextidmBuy = self.processZones(self.demandZone, False, self.demandZoneIsMit)
-        self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
-        self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
+        if self._logic_enabled("enable_order_block"):
+            isAlertextidmSell = self.processZones(self.supplyZone, True, self.supplyZoneIsMit)
+            isAlertextidmBuy = self.processZones(self.demandZone, False, self.demandZoneIsMit)
+            self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
+            self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
 
-        # POI sweeps ---------------------------------------------------------
-        if self.inputs.order_block.showPOI and self.series.length() > 4:
-            if not self.isSweepOBS:
-                self.high_MOBS = self.series.get("high", 3)
-                self.low_MOBS = self.series.get("low", 3)
-                self.current_OBS = self.series.get_time(3)
-                if (
-                    not math.isnan(self.high_MOBS)
-                    and not math.isnan(self.series.get("high", 4))
-                    and not math.isnan(self.series.get("high", 2))
-                    and self.high_MOBS > self.series.get("high", 4)
-                    and self.high_MOBS > self.series.get("high", 2)
-                ):
-                    self.isSweepOBS = True
-            else:
-                if not math.isnan(self.low_MOBS) and self.low_MOBS > self.series.get("high", 1):
-                    if self.current_OBS is not None and not math.isnan(self.high_MOBS) and not math.isnan(self.low_MOBS):
-                        self.handleZone(
-                            self.supplyZone,
-                            self.supplyZoneIsMit,
-                            self.current_OBS,
-                            self.high_MOBS,
-                            self.low_MOBS,
-                            self.inputs.order_block.colorSupply,
-                            False,
-                        )
-                    self.isSweepOBS = False
+            # POI sweeps ---------------------------------------------------------
+            if self.inputs.order_block.showPOI and self.series.length() > 4:
+                if not self.isSweepOBS:
+                    self.high_MOBS = self.series.get("high", 3)
+                    self.low_MOBS = self.series.get("low", 3)
+                    self.current_OBS = self.series.get_time(3)
+                    if (
+                        not math.isnan(self.high_MOBS)
+                        and not math.isnan(self.series.get("high", 4))
+                        and not math.isnan(self.series.get("high", 2))
+                        and self.high_MOBS > self.series.get("high", 4)
+                        and self.high_MOBS > self.series.get("high", 2)
+                    ):
+                        self.isSweepOBS = True
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
-                        mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
-                        mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
-                        mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
-                        self.high_MOBS = max(self.high_MOBS or -math.inf, mother_high)
-                        self.low_MOBS = min(self.low_MOBS or math.inf, mother_low)
-                        self.current_OBS = min(self.current_OBS or time_val, mother_bar)
+                    if not math.isnan(self.low_MOBS) and self.low_MOBS > self.series.get("high", 1):
+                        if self.current_OBS is not None and not math.isnan(self.high_MOBS) and not math.isnan(self.low_MOBS):
+                            self.handleZone(
+                                self.supplyZone,
+                                self.supplyZoneIsMit,
+                                self.current_OBS,
+                                self.high_MOBS,
+                                self.low_MOBS,
+                                self.inputs.order_block.colorSupply,
+                                False,
+                            )
+                        self.isSweepOBS = False
                     else:
-                        self.high_MOBS = self.series.get("high", 2)
-                        self.low_MOBS = self.series.get("low", 2)
-                        self.current_OBS = self.series.get_time(2)
+                        if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                            mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
+                            mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
+                            mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
+                            self.high_MOBS = max(self.high_MOBS or -math.inf, mother_high)
+                            self.low_MOBS = min(self.low_MOBS or math.inf, mother_low)
+                            self.current_OBS = min(self.current_OBS or time_val, mother_bar)
+                        else:
+                            self.high_MOBS = self.series.get("high", 2)
+                            self.low_MOBS = self.series.get("low", 2)
+                            self.current_OBS = self.series.get_time(2)
 
             if not self.isSweepOBD:
                 self.low_MOBD = self.series.get("low", 3)
@@ -7170,12 +7985,15 @@ class SmartMoneyAlgoProE5:
                         self.current_OBD = self.series.get_time(2)
 
         # SCOB and candle colouring -----------------------------------------
-        scob_supply = self.scob(self.supplyZone, True)
-        scob_demand = self.scob(self.demandZone, False)
-        if scob_supply:
-            self.bar_colors.append((time_val, scob_supply))
-        if scob_demand:
-            self.bar_colors.append((time_val, scob_demand))
+        scob_supply: Optional[str] = None
+        scob_demand: Optional[str] = None
+        if self._logic_enabled("enable_order_block"):
+            scob_supply = self.scob(self.supplyZone, True)
+            scob_demand = self.scob(self.demandZone, False)
+            if scob_supply:
+                self.bar_colors.append((time_val, scob_supply))
+            if scob_demand:
+                self.bar_colors.append((time_val, scob_demand))
         if self.inputs.candle.showISB and isb:
             self.bar_colors.append((time_val, self.inputs.candle.colorISB))
         if self.inputs.candle.showOSB and osb:
@@ -7195,17 +8013,53 @@ class SmartMoneyAlgoProE5:
                 self.bxf.set_right(time_val)
             ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
             ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
-            if oi1 is not None:
+            has_anchor = oi1 is not None
+            has_bounds = not math.isnan(ot) and not math.isnan(ob)
+            if has_anchor and has_bounds:
                 if self.bxf and self.bxf in self.boxes:
+                    self._golden_zone_touch_state = None
+                    self._golden_zone_last_touch_time = None
                     self.boxes.remove(self.bxf)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
-                self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
-                self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = float(oi1)
+                top_val = max(ot, ob)
+                bot_val = min(ot, ob)
+                if not math.isclose(top_val, bot_val, rel_tol=1e-9, abs_tol=1e-9):
+                    self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
+                    self.bxf.set_text("Golden zone")
+                    self.bxf.set_text_color(self.inputs.structure_util.oteclr)
+                    self._register_box_event(self.bxf, status="new")
+                    self.bxty = 1 if dir_up else -1
+                    self.prev_oi1 = float(oi1)
+                else:
+                    if self.bxf and self.bxf in self.boxes:
+                        self._golden_zone_touch_state = None
+                        self._golden_zone_last_touch_time = None
+                        self.boxes.remove(self.bxf)
+                    self.bxf = None
+                    self.bxty = 0
+            else:
+                if self.bxf and self.bxf in self.boxes:
+                    self._golden_zone_touch_state = None
+                    self._golden_zone_last_touch_time = None
+                    self.boxes.remove(self.bxf)
+                self.bxf = None
+                self.bxty = 0
+        else:
+            if self.bxf and self.bxf in self.boxes:
+                self._golden_zone_touch_state = None
+                self._golden_zone_last_touch_time = None
+                self.boxes.remove(self.bxf)
+            self.bxf = None
+            self.bxty = 0
+
+        if isinstance(self.bxf, Box):
+            zone_top = max(self.bxf.top, self.bxf.bottom)
+            zone_bottom = min(self.bxf.top, self.bxf.bottom)
+            high = self.series.get("high")
+            low = self.series.get("low")
+            if high >= zone_bottom and low <= zone_top:
+                if self._golden_zone_last_touch_time != time_val:
+                    status = "touched" if self._golden_zone_touch_state != "touched" else "retest"
+                    self._register_box_event(self.bxf, status=status, event_time=time_val)
 
         self._sync_state_mirrors()
 
@@ -7215,17 +8069,7 @@ class SmartMoneyAlgoProE5:
 # ----------------------------------------------------------------------------
 
 
-@dataclass
-class BinanceSymbolSelectorConfig:
-    """User-facing switches controlling Binance symbol prioritisation."""
 
-    prioritize_top_gainers: bool = True
-    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
-    top_gainer_threshold: float = 5.0
-    top_gainer_scope: str = "24h"
-
-
-DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
 
 
 def _safe_symbol_metric(value: Any) -> Optional[float]:
@@ -7489,6 +8333,37 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
         if next_since <= since:
             next_since = since + timeframe_ms
         since = next_since
+    return candles
+
+
+def _fetch_incremental_ohlcv(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    since: Optional[int],
+) -> List[Dict[str, float]]:
+    """Fetch a lightweight OHLCV batch anchored at ``since`` for streaming scans."""
+
+    effective_since = since if since and since > 0 else None
+    raw = exchange.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=limit,
+        since=effective_since,
+    )
+    candles: List[Dict[str, float]] = []
+    for entry in raw or []:
+        candles.append(
+            {
+                "time": entry[0],
+                "open": entry[1],
+                "high": entry[2],
+                "low": entry[3],
+                "close": entry[4],
+                "volume": entry[5],
+            }
+        )
     return candles
 
 
@@ -8280,6 +9155,30 @@ def render_report(
     outfile.write_text(content + "\n")
 
 
+def _get_secret(name: str) -> Optional[str]:
+    try:
+        return os.environ.get(name)
+    except Exception:
+        return None
+
+
+def _send_tg(cfg: Any, lines: Sequence[str]) -> None:
+    if not getattr(cfg, "tg_enable", False):
+        return
+    token = _get_secret("TELEGRAM_BOT_TOKEN")
+    chat_id = _get_secret("TELEGRAM_CHAT_ID")
+    if not token or not chat_id or requests is None:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"},
+            timeout=8,
+        )
+    except Exception:
+        pass
+
+
 def run_runtime_from_file(
     source: Path,
     outfile: Path,
@@ -8302,46 +9201,6 @@ def run_runtime_from_file(
             except Exception:
                 pass
     render_report(runtime, outfile)
-
-
-METRIC_LABELS = [
-    ("alerts", "عدد التنبيهات"),
-    ("pullback_arrows", "إشارات Pullback"),
-    ("choch_labels", "علامات CHoCH"),
-    ("bos_labels", "علامات BOS"),
-    ("idm_labels", "علامات IDM"),
-    ("demand_zones", "مناطق الطلب"),
-    ("supply_zones", "مناطق العرض"),
-    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
-    ("idm_ob_touched", "IDM OB تم ملامستها"),
-    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
-    ("ext_ob_touched", "EXT OB تم ملامستها"),
-    ("bullish_fvg", "فجوات FVG صاعدة"),
-    ("bearish_fvg", "فجوات FVG هابطة"),
-    ("order_flow_boxes", "صناديق Order Flow"),
-    ("liquidity_objects", "مستويات السيولة"),
-    ("scob_colored_bars", "شموع SCOB"),
-]
-
-
-EVENT_DISPLAY_ORDER = [
-    ("BOS", "BOS"),
-    ("BOS_PLUS", "BOS+"),
-    ("CHOCH", "CHOCH"),
-    ("MSS_PLUS", "MSS+"),
-    ("MSS", "MSS"),
-    ("IDM", "IDM"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
-    ("GOLDEN_ZONE", "Golden zone"),
-    ("X", "X"),
-    ("RED_CIRCLE", "الدوائر الحمراء"),
-    ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
-]
 
 
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
@@ -8845,6 +9704,59 @@ def scan_binance(
     inputs.structure_util.isOTE = True
     inputs.structure_util.markX = True
     inputs.structure_util.showSw = True
+    alert_cfg: Optional[ImmediateAlertInputs] = getattr(inputs, "immediate_alerts", None)
+    event_cache = _build_immediate_event_cache(alert_cfg)
+    scanner_cfg = getattr(inputs, "scanner_runtime", None)
+
+    def _scanner_attr(name: str, default: Any = None) -> Any:
+        if scanner_cfg is None:
+            return default
+        if isinstance(scanner_cfg, dict):
+            return scanner_cfg.get(name, default)
+        return getattr(scanner_cfg, name, default)
+
+    effective_concurrency = max(1, int(concurrency) if concurrency else 1)
+    configured_parallel = _scanner_attr("parallel_tasks")
+    if configured_parallel is not None:
+        try:
+            effective_concurrency = max(1, int(configured_parallel))
+        except Exception:
+            pass
+    transport_mode = str(_scanner_attr("transport", "rest") or "rest").lower()
+    if transport_mode not in {"rest"}:
+        raise NotImplementedError(
+            f"Transport mode '{transport_mode}' غير مدعوم حاليًا؛ REST فقط متاح"
+        )
+    mode = str(_scanner_attr("mode", "once") or "once").lower()
+    poll_interval = _scanner_attr("poll_interval_seconds", 5.0)
+    try:
+        poll_interval = float(poll_interval)
+    except Exception:
+        poll_interval = 5.0
+    if poll_interval < 0:
+        poll_interval = 0.0
+    stream_duration = _scanner_attr("stream_duration_seconds")
+    if stream_duration is not None:
+        try:
+            stream_duration = float(stream_duration)
+        except Exception:
+            stream_duration = None
+        if stream_duration is not None and stream_duration <= 0:
+            stream_duration = None
+    max_cycles_cfg = _scanner_attr("max_cycles")
+    if max_cycles_cfg is not None:
+        try:
+            max_cycles_cfg = int(max_cycles_cfg)
+        except Exception:
+            max_cycles_cfg = None
+        if max_cycles_cfg is not None and max_cycles_cfg <= 0:
+            max_cycles_cfg = None
+    incremental_limit = _scanner_attr("incremental_limit", 120)
+    try:
+        incremental_limit = int(incremental_limit)
+    except Exception:
+        incremental_limit = 120
+    incremental_limit = max(10, incremental_limit)
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -8852,8 +9764,6 @@ def scan_binance(
     )
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
-    summaries: List[Dict[str, Any]] = []
-    primary_runtime: Optional[SmartMoneyAlgoProE5] = None
     window = recent_window_bars
     if window is None:
         console_inputs = getattr(inputs, "console", None) if inputs else None
@@ -8865,86 +9775,408 @@ def scan_binance(
         else:
             window = 2
     window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-        except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-        daily_change = _extract_daily_change_percent(ticker)
-        if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
-            print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_daily_change",
-                    timestamp=None,
-                    symbol=symbol,
-                    change=daily_change,
-                    threshold=min_daily_change,
-                )
-            continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-        runtime.process(candles)
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        strategy_matches = detect_ict_strategy(exchange, symbol, inputs, tracer)
-        if strategy_matches:
-            metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits and not strategy_matches:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
-                )
-            continue
+    async def _scan_once_async() -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+        runtime_map: Dict[str, SmartMoneyAlgoProE5] = {}
+        summaries_by_index: Dict[int, Dict[str, Any]] = {}
+        primary_symbol: Optional[str] = None
+        alert_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 
-        metrics["daily_change_percent"] = daily_change
-        summaries.append(
-            {
+        def alert_sink(event: Dict[str, Any]) -> None:
+            alert_queue.put_nowait(event)
+
+        _smoke_test_immediate_alert_sink(alert_queue, alert_sink)
+        semaphore = asyncio.Semaphore(effective_concurrency)
+        cache_lock = asyncio.Lock()
+
+        async def alert_consumer() -> None:
+            while True:
+                event = await alert_queue.get()
+                if event is None:
+                    alert_queue.task_done()
+                    break
+                try:
+                    message = _format_immediate_event_message(event)
+                    print(
+                        _colorize_directional_text(message, direction=event.get("direction")),
+                        flush=True,
+                    )
+                finally:
+                    alert_queue.task_done()
+
+        consumer_task = asyncio.create_task(alert_consumer())
+
+        async def process_symbol(index: int, symbol: str) -> None:
+            nonlocal primary_symbol
+            try:
+                async with semaphore:
+                    ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+            except Exception as exc:
+                print(
+                    f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+            daily_change = _extract_daily_change_percent(ticker)
+            if (
+                min_daily_change > 0.0
+                and daily_change is not None
+                and daily_change <= min_daily_change
+            ):
+                print(
+                    f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                    flush=True,
+                )
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_daily_change",
+                        timestamp=None,
+                        symbol=symbol,
+                        change=daily_change,
+                        threshold=min_daily_change,
+                    )
+                return
+            try:
+                async with semaphore:
+                    candles = await asyncio.to_thread(
+                        fetch_ohlcv, exchange, symbol, timeframe, limit
+                    )
+            except Exception as exc:
+                print(
+                    f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ohlcv: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+            candle_count = len(candles)
+            runtime = runtime_map.get(symbol)
+            if runtime is None:
+                runtime = SmartMoneyAlgoProE5(
+                    inputs=_clone_indicator_inputs(inputs),
+                    base_timeframe=timeframe,
+                    tracer=tracer,
+                )
+                runtime_map[symbol] = runtime
+            if candles:
+                if runtime.series.length() > 0:
+                    last_time = runtime.series.get_time(0)
+                    new_candles = [c for c in candles if int(c["time"]) > last_time]
+                else:
+                    new_candles = candles
+                if new_candles:
+                    runtime.process(new_candles)
+                elif runtime.series.length() == 0:
+                    runtime.process(candles)
+            metrics = runtime.gather_console_metrics()
+            latest_events = metrics.get("latest_events") or {}
+            async with cache_lock:
+                immediate_events = _collect_immediate_events(
+                    symbol,
+                    timeframe,
+                    latest_events,
+                    runtime,
+                    event_cache,
+                    alert_cfg,
+                    event_sink=alert_sink,
+                )
+            if immediate_events:
+                metrics.setdefault("immediate_event_alerts", []).extend(immediate_events)
+            strategy_matches: List[ICTStrategyMatch] = []
+            try:
+                async with semaphore:
+                    strategy_matches = await asyncio.to_thread(
+                        detect_ict_strategy,
+                        exchange,
+                        symbol,
+                        inputs,
+                        tracer,
+                    )
+            except Exception:
+                strategy_matches = []
+            if strategy_matches:
+                metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
+            recent_hits, recent_times = _collect_recent_event_hits(
+                runtime.series, latest_events, bars=window
+            )
+            if not recent_hits and not strategy_matches and not immediate_events:
+                print(
+                    f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
+                    flush=True,
+                )
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_stale_events",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        reference_times=recent_times,
+                        window=window,
+                    )
+                return
+
+            metrics["daily_change_percent"] = daily_change
+            summaries_by_index[index] = {
                 "symbol": symbol,
                 "timeframe": timeframe,
-                "candles": len(candles),
+                "candles": candle_count,
                 "alerts": metrics.get("alerts", len(runtime.alerts)),
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
             }
-        )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-        if tracer and tracer.enabled:
-            tracer.log(
-                "scan",
-                "symbol_complete",
-                timestamp=runtime.series.get_time(0),
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
-            )
+            print_symbol_summary(index, symbol, timeframe, candle_count, metrics)
+            if tracer and tracer.enabled:
+                tracer.log(
+                    "scan",
+                    "symbol_complete",
+                    timestamp=runtime.series.get_time(0),
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candles=candle_count,
+                )
+            if primary_symbol is None:
+                primary_symbol = symbol
+
+        tasks = [
+            asyncio.create_task(process_symbol(idx, symbol))
+            for idx, symbol in enumerate(all_symbols)
+        ]
+        if tasks:
+            await asyncio.gather(*tasks)
+        await alert_queue.join()
+        await alert_queue.put(None)
+        await alert_queue.join()
+        await consumer_task
+
+        sorted_indices = sorted(summaries_by_index.keys())
+        summaries_sorted = [summaries_by_index[i] for i in sorted_indices]
+        primary_runtime: Optional[SmartMoneyAlgoProE5]
+        if primary_symbol is not None:
+            primary_runtime = runtime_map.get(primary_symbol)
+        else:
+            primary_runtime = None
+        if primary_runtime is None and runtime_map:
+            primary_runtime = next(iter(runtime_map.values()))
         if primary_runtime is None:
-            primary_runtime = runtime
-    if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
-        primary_runtime.process([])
+            primary_runtime = SmartMoneyAlgoProE5(
+                inputs=_clone_indicator_inputs(inputs),
+                tracer=tracer,
+            )
+            primary_runtime.process([])
+        return primary_runtime, summaries_sorted
+
+    async def _scan_stream_async() -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+        runtime_map: Dict[str, SmartMoneyAlgoProE5] = {}
+        summaries_by_symbol: Dict[str, Dict[str, Any]] = {}
+        alert_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        cache_lock = asyncio.Lock()
+        semaphore = asyncio.Semaphore(effective_concurrency)
+        timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
+        timeframe_ms = timeframe_seconds * 1000
+        stop_event = asyncio.Event()
+
+        def alert_sink(event: Dict[str, Any]) -> None:
+            alert_queue.put_nowait(event)
+
+        _smoke_test_immediate_alert_sink(alert_queue, alert_sink)
+
+        async def alert_consumer() -> None:
+            while True:
+                event = await alert_queue.get()
+                if event is None:
+                    alert_queue.task_done()
+                    break
+                try:
+                    message = _format_immediate_event_message(event)
+                    print(
+                        _colorize_directional_text(message, direction=event.get("direction")),
+                        flush=True,
+                    )
+                finally:
+                    alert_queue.task_done()
+
+        async def supervisor() -> None:
+            try:
+                if stream_duration is not None:
+                    await asyncio.sleep(stream_duration)
+                    stop_event.set()
+                    return
+                if max_cycles_cfg is None:
+                    return
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                pass
+
+        consumer_task = asyncio.create_task(alert_consumer())
+        supervisor_task = asyncio.create_task(supervisor()) if stream_duration else None
+
+        async def process_symbol(symbol_index: int, symbol: str) -> None:
+            runtime = runtime_map.get(symbol)
+            if runtime is None:
+                runtime = SmartMoneyAlgoProE5(
+                    inputs=_clone_indicator_inputs(inputs),
+                    base_timeframe=timeframe,
+                    tracer=tracer,
+                )
+                runtime_map[symbol] = runtime
+            cycles = 0
+            last_time = runtime.series.get_time(0) if runtime.series.length() > 0 else None
+            first_pass = True
+            while not stop_event.is_set():
+                try:
+                    async with semaphore:
+                        ticker = await asyncio.to_thread(exchange.fetch_ticker, symbol)
+                    ticker_daily_change = _extract_daily_change_percent(ticker)
+                except Exception as exc:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    await asyncio.sleep(max(1.0, poll_interval))
+                    continue
+                if (
+                    first_pass
+                    and min_daily_change > 0.0
+                    and ticker_daily_change is not None
+                    and ticker_daily_change <= min_daily_change
+                ):
+                    print(
+                        f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {ticker_daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                        flush=True,
+                    )
+                    if tracer and tracer.enabled:
+                        tracer.log(
+                            "scan",
+                            "symbol_skipped_daily_change",
+                            timestamp=None,
+                            symbol=symbol,
+                            change=ticker_daily_change,
+                            threshold=min_daily_change,
+                        )
+                    return
+                try:
+                    async with semaphore:
+                        if first_pass:
+                            candles = await asyncio.to_thread(
+                                fetch_ohlcv, exchange, symbol, timeframe, limit
+                            )
+                        else:
+                            since = 0 if last_time is None else max(0, int(last_time - timeframe_ms))
+                            candles = await asyncio.to_thread(
+                                _fetch_incremental_ohlcv,
+                                exchange,
+                                symbol,
+                                timeframe,
+                                incremental_limit,
+                                since,
+                            )
+                except Exception as exc:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ohlcv: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    await asyncio.sleep(max(1.0, poll_interval))
+                    continue
+                first_pass = False
+                candle_count = len(candles)
+                if candles:
+                    if last_time is not None:
+                        new_candles = [c for c in candles if int(c["time"]) > last_time]
+                    else:
+                        new_candles = candles
+                    if new_candles:
+                        runtime.process(new_candles)
+                        last_time = runtime.series.get_time(0)
+                metrics = runtime.gather_console_metrics()
+                latest_events = metrics.get("latest_events") or {}
+                async with cache_lock:
+                    immediate_events = _collect_immediate_events(
+                        symbol,
+                        timeframe,
+                        latest_events,
+                        runtime,
+                        event_cache,
+                        alert_cfg,
+                        event_sink=alert_sink,
+                    )
+                if immediate_events:
+                    metrics.setdefault("immediate_event_alerts", []).extend(immediate_events)
+                metrics["daily_change_percent"] = ticker_daily_change
+                summaries_by_symbol[symbol] = {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": candle_count,
+                    "alerts": metrics.get("alerts", len(runtime.alerts)),
+                    "boxes": metrics.get("boxes", len(runtime.boxes)),
+                    "metrics": metrics,
+                }
+                print_symbol_summary(symbol_index, symbol, timeframe, candle_count, metrics)
+                cycles += 1
+                if max_cycles_cfg is not None and cycles >= max_cycles_cfg:
+                    break
+                if stream_duration is None and max_cycles_cfg is None and poll_interval <= 0:
+                    await asyncio.sleep(timeframe_seconds)
+                else:
+                    await asyncio.sleep(max(0.1, poll_interval))
+            return
+
+        tasks = [
+            asyncio.create_task(process_symbol(idx, symbol))
+            for idx, symbol in enumerate(all_symbols)
+        ]
+
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            stop_event.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if supervisor_task:
+                supervisor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await supervisor_task
+            await alert_queue.join()
+            await alert_queue.put(None)
+            await alert_queue.join()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer_task
+
+        summaries_sorted = [
+            summaries_by_symbol[s]
+            for s in sorted(summaries_by_symbol.keys(), key=lambda sym: all_symbols.index(sym))
+        ]
+        primary_runtime: Optional[SmartMoneyAlgoProE5]
+        if all_symbols:
+            primary_runtime = runtime_map.get(all_symbols[0])
+        else:
+            primary_runtime = None
+        if primary_runtime is None and runtime_map:
+            primary_runtime = next(iter(runtime_map.values()))
+        if primary_runtime is None:
+            primary_runtime = SmartMoneyAlgoProE5(
+                inputs=_clone_indicator_inputs(inputs),
+                tracer=tracer,
+            )
+            primary_runtime.process([])
+        return primary_runtime, summaries_sorted
+
+    if mode in {"stream", "live", "continuous"}:
+        coroutine = _scan_stream_async()
+    else:
+        coroutine = _scan_once_async()
+    primary_runtime, summaries = asyncio.run(coroutine)
+    if event_cache is not None:
+        event_cache.save()
+    try:
+        exchange.close()
+    except Exception:  # pragma: no cover - defensive cleanup
+        pass
     return primary_runtime, summaries
 
 
@@ -8990,6 +10222,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=1,
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
+    parser.add_argument(
+        "--scan-mode",
+        choices=["once", "stream"],
+        default="stream",
+        help="الوضع الافتراضي 'stream' يشغّل الماسح المتوازي المستمر؛ اختر 'once' للمسح المفرد",
+    )
+    parser.add_argument(
+        "--scan-poll",
+        type=float,
+        default=2.0,
+        help="الفاصل بالثواني بين دورات التحديث عند البث المباشر",
+    )
+    parser.add_argument(
+        "--scan-duration",
+        type=float,
+        default=0.0,
+        help="المدة الكلية بالثواني للبث المباشر (0 يعني حتى استنفاد الدورات)",
+    )
+    parser.add_argument(
+        "--scan-cycles",
+        type=int,
+        default=0,
+        help="عدد الدورات لكل رمز عند البث المباشر (0 أو أقل يعني بلا حد)",
+    )
+    parser.add_argument(
+        "--scan-incremental-limit",
+        type=int,
+        default=120,
+        help="عدد الشموع التي يتم جلبها في كل تحديث متدفق بعد الدفعة الأولى",
+    )
     args = parser.parse_args(argv)
     if args.min_daily_change < 0.0:
         parser.error("--min-daily-change يجب أن يكون رقمًا غير سالب")
@@ -9010,6 +10272,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     indicator_inputs = IndicatorInputs()
     indicator_inputs.console.max_age_bars = args.max_age_bars
+    indicator_inputs.scanner_runtime.parallel_tasks = max(1, args.concurrency)
+    indicator_inputs.scanner_runtime.mode = args.scan_mode
+    indicator_inputs.scanner_runtime.poll_interval_seconds = args.scan_poll
+    indicator_inputs.scanner_runtime.stream_duration_seconds = (
+        args.scan_duration if args.scan_duration > 0 else None
+    )
+    indicator_inputs.scanner_runtime.max_cycles = (
+        args.scan_cycles if args.scan_cycles > 0 else None
+    )
+    indicator_inputs.scanner_runtime.incremental_limit = max(10, args.scan_incremental_limit)
 
     if args.pullback_report:
         log("Foundation")
@@ -9089,756 +10361,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     tracer.emit()
     return 0
 
-
-# ============================================================================
-# Embedded Binance symbol picker + live scanner CLI (non-invasive)
-# - لا تغييرات على منطق المؤشر؛ كل شيء هنا مستقل ويستدعي الواجهات العامة فقط
-# ============================================================================
-from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
-import argparse, os, sys, time
-
-try:
-    import ccxt  # type: ignore
-except Exception:
-    ccxt = None  # type: ignore
-
-try:
-    import requests  # type: ignore
-except Exception:
-    requests = None  # type: ignore
-
-# ----------------------------- Filters & Helpers -----------------------------
-_MEME_BASES = {
-    "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BABYDOGE","MOG","DEGEN","PONKE","BODEN","MEME",
-    "AIDOGE","MEOW","GME","TOSHI","HOPPY","KITTY","LADYS","CREAM","PIPI","JEET","CHILLGUY","HUAHUA"
-}
-_DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
-
-
-@dataclass(frozen=True)
-class _EditorAutorunDefaults:
-    timeframe: str = "1m"
-    candle_limit: int = 600
-    max_symbols: int = 60
-    recent_bars: int = 2
-
-
-EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
-
-
-def _pct_24h(t: Dict) -> float:
-    v = t.get("percentage")
-    if v is None and isinstance(t.get("info"), dict):
-        v = t["info"].get("priceChangePercent")
-    try:
-        return float(v)
-    except Exception:
-        return 0.0
-
-def _qv_24h(t: Dict) -> float:
-    v = t.get("quoteVolume")
-    if v is None and isinstance(t.get("info"), dict):
-        v = t["info"].get("quoteVolume")
-    try:
-        return float(v) if v is not None else 0.0
-    except Exception:
-        return 0.0
-
-def _base(sym: str) -> str:
-    if "/" in sym:
-        return sym.split("/")[0]
-    if sym.endswith("USDT"):
-        return sym[:-4]
-    return sym
-
-def _normalize_list(csv_like: str) -> List[str]:
-    if not csv_like:
-        return []
-    return [x.strip().upper() for x in csv_like.split(",") if x.strip()]
-
-# ----------------------------- CLI Settings ----------------------------------
-@dataclass
-class _CLISettings:
-    # indicator toggles that exist in port (wired where safe)
-    showHL: bool = False
-    showMn: bool = False
-    showISOB: bool = True
-    showMajoinMiner: bool = False
-    showCircleHL: bool = True
-    showSMC: bool = True
-    lengSMC: int = 40
-    swing_size: int = 10
-    show_fvg: bool = True
-    show_liquidity: bool = True
-    liquidity_display_limit: int = 20
-    drop_last_incomplete: bool = False
-    # scanner controls
-    tg_enable: bool = False
-    tg_title_prefix: str = "SMC Alert"
-    # matching indicator behavior
-    ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
-    zone_type: str = "Mother Bar"  # goes to order_block.poi_type
-    bos_confirmation: str = "Close"
-    strict_close_for_break: bool = False
-    # filters
-    market: str = "usdtm"         # {usdtm, spot}
-    min_change: float = 5.0       # ≥ %
-    min_volume: float = 30_000_000.0  # ≥ USDT
-    max_scan: int = 60            # after filtering & sorting
-    allow_meme: bool = False
-    exclude_symbols: str = ""
-    exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
-    include_only: str = ""
-
-def _get_secret(name: str) -> Optional[str]:
-    return os.environ.get(name)
-
-def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
-    if not cfg.tg_enable:
-        return
-    token = _get_secret("TELEGRAM_BOT_TOKEN")
-    chat_id = _get_secret("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or requests is None:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"}, timeout=8)
-    except Exception:
-        pass
-
-# ----------------------------- Symbol Picker ----------------------------------
-def _build_exchange(market: str):
-    # Futures-only
-    return ccxt.binanceusdm({"enableRateLimit": True})
-
-def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_symbols_hint: int = 300) -> List[str]:
-    if symbol_override:
-        return [symbol_override.strip().upper()]
-    ex = _build_exchange(cfg.market)
-    markets = ex.load_markets()
-    if cfg.market == "usdtm":
-        universe = [s for s, m in markets.items() if m.get("linear") and m.get("quote") == "USDT" and m.get("type") == "swap"]
-    else:
-        universe = [s for s, m in markets.items() if m.get("spot") and m.get("quote") == "USDT"]
-    try:
-        ticks = ex.fetch_tickers(universe)
-    except Exception:
-        # fallback: greedy highest-volume
-        universe_sorted = sorted(universe)[:min(max_symbols_hint, cfg.max_scan)]
-        return universe_sorted
-
-    excl_syms = set(_normalize_list(cfg.exclude_symbols))
-    excl_patterns = set(_normalize_list(cfg.exclude_patterns))
-    inc_only = set(_normalize_list(cfg.include_only))
-
-    def allow(sym: str) -> bool:
-        u = sym.upper()
-        if u in excl_syms:
-            return False
-        b = _base(sym).upper()
-        if inc_only and not any(k in b for k in inc_only):
-            return False
-        if not cfg.allow_meme:
-            if b in _MEME_BASES:
-                return False
-            if any(p in b for p in excl_patterns):
-                return False
-        t = ticks.get(sym) or {}
-        if _pct_24h(t) < cfg.min_change:
-            return False
-        if _qv_24h(t) < cfg.min_volume:
-            return False
-        return True
-
-    cands = [s for s in universe if allow(s)]
-    cands.sort(key=lambda s: _qv_24h(ticks.get(s) or {}), reverse=True)
-    if not cands:
-        cands = sorted(universe, key=lambda s: _qv_24h(ticks.get(s) or {}), reverse=True)
-        if not cfg.allow_meme:
-            cands = [s for s in cands if _base(s).upper() not in _MEME_BASES]
-    return cands[:min(cfg.max_scan, max_symbols_hint)]
-
-# ----------------------------- CLI & Router -----------------------------------
-def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
-    p = argparse.ArgumentParser(prog="SMC Binance Scanner (embedded)")
-    # market / selection
-    p.add_argument("--symbol", "-s", default="")
-    p.add_argument("--max-symbols", "-n", type=int, default=300)
-    # timeframe/limit
-    p.add_argument("--timeframe", "-t", default="1m")
-    p.add_argument("--limit", "-l", type=int, default=800)
-    p.add_argument("--drop-last", action="store_true", default=False)
-    # indicator view toggles
-    p.add_argument("--show-hl", action="store_true", default=False)
-    p.add_argument("--show-mn", action="store_true", default=False)
-    p.add_argument("--show-isob", dest="show_isob", action="store_true")
-    p.add_argument("--no-isob", dest="show_isob", action="store_false")
-    p.set_defaults(show_isob=None)
-    p.add_argument("--show-major-minor", action="store_true", default=False)
-    p.add_argument("--show-circle-hl", action="store_true", default=True)
-    p.add_argument("--no-smc", action="store_true")
-    p.add_argument("--leng-smc", type=int, default=40)
-    p.add_argument("--swing-size", type=int, default=10)
-    p.add_argument("--no-fvg", action="store_true")
-    p.add_argument("--no-liquidity", action="store_true")
-    p.add_argument("--liquidity-limit", type=int, default=20)
-    # behavior/alerts (output only)
-    p.add_argument("--mitigation", choices=["WICK","CLOSE"], default="CLOSE")
-    p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
-    p.add_argument("--no-bos-plus", action="store_true")
-    p.add_argument("--no-ob-break", action="store_true")
-    p.add_argument("--no-ote", action="store_true")
-    p.add_argument("--no-ote-alert", action="store_true")
-    p.add_argument("--no-mark-x", action="store_true")
-    # filters
-    p.add_argument("--min-change", type=float, default=5.0)
-    p.add_argument("--min-volume", type=float, default=30_000_000.0)
-    p.add_argument("--max-scan", type=int, default=60)
-    p.add_argument("--allow-meme", action="store_true", default=False)
-    p.add_argument("--exclude-symbols", default="")
-    p.add_argument("--exclude-patterns", default=_DEFAULT_EXCLUDE_PATTERNS)
-    p.add_argument("--include-only", default="")
-    # misc
-    p.add_argument("--recent", type=int, default=2)
-    p.add_argument("--verbose", "-v", action="store_true", default=False)
-    p.add_argument("--debug", action="store_true", default=False)
-    p.add_argument("--tg", action="store_true", default=False)
-    args, _ = p.parse_known_args()
-
-    cfg = _CLISettings(
-        market='usdtm',  # forced futures-only
-        showHL=args.show_hl,
-        showMn=args.show_mn,
-        showISOB=True if args.show_isob is None else args.show_isob,
-        showMajoinMiner=args.show_major_minor,
-        showCircleHL=args.show_circle_hl,
-        showSMC=not args.no_smc,
-        lengSMC=args.leng_smc,
-        swing_size=args.swing_size,
-        show_fvg=not args.no_fvg,
-        show_liquidity=not args.no_liquidity,
-        liquidity_display_limit=args.liquidity_limit,
-        tg_enable=args.tg,
-        ob_test_mode=args.mitigation,
-        bos_confirmation=args.bos_confirmation,
-        strict_close_for_break=(args.bos_confirmation == "Close"),
-        min_change=args.min_change,
-        min_volume=args.min_volume,
-        max_scan=args.max_scan,
-        allow_meme=args.allow_meme,
-        exclude_symbols=args.exclude_symbols,
-        exclude_patterns=args.exclude_patterns,
-        include_only=args.include_only,
-        drop_last_incomplete=args.drop_last,
-    )
-    return cfg, args
-
-def _should_route_android(argv: List[str]) -> bool:
-    knobs = {
-        "--symbol","-s","--max-symbols","-n","--timeframe","-t","--limit","-l","--drop-last",
-        "--show-hl","--show-mn","--show-isob","--no-isob","--show-major-minor","--show-circle-hl","--no-smc",
-        "--leng-smc","--swing-size","--no-fvg","--no-liquidity","--liquidity-limit",
-        "--mitigation","--bos-confirmation","--no-bos-plus","--no-ob-break","--no-ote","--no-ote-alert","--no-mark-x",
-        "--min-change","--min-volume","--max-scan","--allow-meme","--exclude-symbols","--exclude-patterns","--include-only",
-        "--recent","--verbose","-v","--debug","--tg"
-    }
-    return any(a in knobs for a in argv)
-
-# ----------------------------- Runner -----------------------------------------
-
-# ===================== Arabic Renderer (format only) ==========================
-def _ar_num(x):
-    try:
-        if isinstance(x, (int, float)):
-            if abs(x) >= 1e6:
-                return f"{x/1e6:.2f}M"
-            if abs(x) >= 1e3:
-                return f"{x/1e3:.2f}K"
-            return f"{x:.4f}" if isinstance(x, float) else str(x)
-        return str(x)
-    except Exception:
-        return str(x)
-
-_AR_KEYS = {
-    "PULLBACK": ["pullback"],
-    "CHOCH"   : ["choch", "ch o ch", "chöch"],
-    "BOS"     : ["bos", "b 0 s"],
-    "IDM"     : ["idm"],
-    "DEMAND"  : ["demand", "طلب"],
-    "SUPPLY"  : ["supply", "عرض"],
-    "FVG_UP"  : ["fvg up", "fvg صاعدة", "fvg↑"],
-    "FVG_DN"  : ["fvg down", "fvg هابطة", "fvg↓"],
-    "OF_BOX"  : ["order flow", "flow box"],
-    "LIQ"     : ["liquidity", "سيولة"],
-    "SCOB"    : ["scob"],
-}
-# Buckets for "latest per logic"
-_LAST_BUCKETS = {
-    "BOS": ["bos", "b 0 s"],
-    "CHOCH": ["choch", "ch o ch"],
-    "Golden zone": ["golden zone"],
-    "IDM": ["idm @", " i d m "],
-    "EXT OB": ["ext ob", "ext_ob", "ext  ob"],
-    "IDM OB": ["idm ob"],
-    "Hist IDM OB": ["hist idm ob"],
-    "Hist EXT OB": ["hist ext ob"],
-    "الدوائر الحمراء": ["الدوائر الحمراء", "red circle"],
-    "الدوائر الخضراء": ["الدوائر الخضراء", "green circle"],
-}
-# ---- Bind to indicator metrics if available ----
-_METRIC_MAP = {
-    "BOS": ["BOS", "bos"],
-    "CHOCH": ["CHOCH", "choch"],
-    "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
-    "IDM": ["IDM", "idm"],
-    "EXT OB": ["EXT_OB", "ext_ob", "EXT-OB"],
-    "IDM OB": ["IDM_OB", "idm_ob"],
-    "Hist IDM OB": ["HIST_IDM_OB", "hist_idm_ob"],
-    "Hist EXT OB": ["HIST_EXT_OB", "hist_ext_ob"],
-    "الدوائر الحمراء": ["RED_CIRCLE", "red_circle", "RED_CIRCLES"],
-    "الدوائر الخضراء": ["GREEN_CIRCLE", "green_circle", "GREEN_CIRCLES"],
-}
-
-def _ci_get(d, key):
-    # case-insensitive get for dict
-    if not isinstance(d, dict):
-        return None
-    if key in d:
-        return d[key]
-    lk = key.lower()
-    for k,v in d.items():
-        try:
-            if str(k).lower() == lk:
-                return v
-        except Exception:
-            pass
-    return None
-
-def _extract_latest_from_runtime(runtime):
-    """
-    Return dict: {label: (ts_ms, display_str)} using runtime.gather_console_metrics() if present.
-    Fallback to alerts keyword scan.
-    """
-    result = {}
-    # 1) Prefer structured metrics
-    try:
-        if hasattr(runtime, "gather_console_metrics"):
-            m = runtime.gather_console_metrics() or {}
-            latest = _ci_get(m, "latest_events") or {}
-            # Some implementations store lists per key or dicts with 'display'/'ts'
-            for label, keys in _METRIC_MAP.items():
-                found = None
-                for k in keys:
-                    candidate = latest.get(k) if isinstance(latest, dict) else None
-                    if candidate is None and isinstance(latest, dict):
-                        # try case-insensitive
-                        candidate = _ci_get(latest, k)
-                    if candidate is None:
-                        continue
-                    if isinstance(candidate, dict):
-                        ts = candidate.get("ts") or candidate.get("time") or candidate.get("timestamp")
-                        disp = candidate.get("display") or candidate.get("text") or candidate.get("title") or str(candidate)
-                        found = (ts or 0, disp)
-                        break
-                    if isinstance(candidate, (list, tuple)) and candidate:
-                        # assume list of dicts or tuples
-                        c = candidate[-1]
-                        if isinstance(c, dict):
-                            ts = c.get("ts") or c.get("time") or c.get("timestamp")
-                            disp = c.get("display") or c.get("text") or c.get("title") or str(c)
-                            found = (ts or 0, disp)
-                        elif isinstance(c, (list, tuple)) and len(c) >= 2:
-                            found = (c[0], c[1])
-                        else:
-                            found = (0, str(c))
-                        break
-                    # fallback: just a string
-                    if isinstance(candidate, str):
-                        found = (0, candidate)
-                        break
-                if found:
-                    result[label] = found
-    except Exception:
-        pass
-
-    # 2) Fallback from alerts text if not found
-    if (not result) and hasattr(runtime, "alerts"):
-        alerts = list(getattr(runtime, "alerts"))
-        for name, item in _last_by_keywords(alerts, _LAST_BUCKETS):
-            if item is not None:
-                result[name] = item
-    return result
-
-def _last_by_keywords(alerts, mapping):
-    # alerts: [(ts_ms, title)]
-    latest = {}
-    for ts, title in alerts:
-        t = (title or "").lower()
-        for name, kws in mapping.items():
-            if any(kw in t for kw in kws):
-                if name not in latest or ts > latest[name][0]:
-                    latest[name] = (ts, title)
-    # return ordered list according to mapping keys
-    out = []
-    for name in mapping.keys():
-        out.append((name, latest.get(name)))
-    return out
-
-
-def _count_by_keywords(alerts):
-    out = {k: 0 for k in _AR_KEYS}
-    for _, title in alerts:
-        t = (title or "").lower()
-        for key, kws in _AR_KEYS.items():
-            if any(kw in t for kw in kws):
-                out[key] += 1
-    return out
-
-def _fetch_pct_change(exchange, symbol):
-    try:
-        t = exchange.fetch_ticker(symbol)
-        v = t.get("percentage")
-        if v is None and isinstance(t.get("info"), dict):
-            v = t["info"].get("priceChangePercent")
-        return float(v) if v is not None else None
-    except Exception:
-        return None
-
-def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
-    ln = 0
-    try:
-        ln = runtime.series.length()
-    except Exception:
-        pass
-    last_close = None
-    try:
-        last_close = runtime.series.get("close")
-    except Exception:
-        pass
-    pct = _fetch_pct_change(exchange, symbol)
-    pct_s = f"{pct:+.2f}%" if pct is not None else "—"
-
-    hdr = f"{_format_symbol(symbol)} ({timeframe}) تحليل"
-    print(f"\n===== {hdr} =====")
-    print(f"عدد الشموع: {ln}  |  السعر الحالي: {_ar_num(last_close) if last_close is not None else '—'}  |  تغيّر 24 ساعة: {pct_s}")
-
-    counts = _count_by_keywords(recent_alerts)
-    def c(k): return counts.get(k, 0)
-
-    print("\nعدد التنبيهات :", len(recent_alerts))
-    print("إشارات Pullback :", c("PULLBACK"))
-    print("علامات CHoCH    :", c("CHOCH"))
-    print("علامات BOS      :", c("BOS"))
-    print("علامات IDM      :", c("IDM"))
-    print("مناطق الطلب     :", c("DEMAND"))
-    print("مناطق العرض     :", c("SUPPLY"))
-    box_tally = getattr(runtime, "console_box_status_tally", {})
-
-    def _box_total(name: str, statuses: Sequence[str]) -> int:
-        if not isinstance(box_tally, dict):
-            return 0
-        counter = box_tally.get(name, {})
-        if not isinstance(counter, dict):
-            return 0
-        total = 0
-        for status in statuses:
-            value = counter.get(status, 0)
-            if isinstance(value, (int, float)):
-                total += int(value)
-        return total
-
-    print("IDM OB تم إنشائها حديثاً:", _box_total("IDM_OB", ("new",)))
-    print("IDM OB تم ملامستها    :", _box_total("IDM_OB", ("touched", "retest")))
-    print("EXT OB تم إنشائها حديثاً:", _box_total("EXT_OB", ("new",)))
-    print("EXT OB تم ملامستها    :", _box_total("EXT_OB", ("touched", "retest")))
-    print("فجوات FVG صاعدة :", c("FVG_UP"))
-    print("فجوات FVG هابطة :", c("FVG_DN"))
-    print("صناديق Order Flow:", c("OF_BOX"))
-    print("مستويات السيولة :", c("LIQ"))
-    print("شموع SCOB       :", c("SCOB"))
-
-    print("\nأحدث الإشارات مع الأسعار")
-    if not recent_alerts:
-        print("—")
-    else:
-        # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
-        for name in _LAST_BUCKETS.keys():
-            item = latest.get(name)
-            if not item:
-                continue
-            ts, title = item
-            try:
-                ts_s = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts/1000)) if ts else "—"
-            except Exception:
-                ts_s = "—"
-            colored_title = _colorize_directional_text(title)
-            print(f"- {name}: {ts_s} UTC  |  {colored_title}")
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-    recent_window = max(1, args.recent)
-
-    # Build symbols first with strong filters
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-
-    # Construct indicator inputs (no changes to core logic)
-    try:
-        (
-            SmartMoneyAlgoProE5,
-            IndicatorInputs,
-            PullbackInputs,
-            MarketStructureInputs,
-            OrderFlowInputs,
-            FVGInputs,
-            LiquidityInputs,
-            DemandSupplyInputs,
-            OrderBlockInputs,
-            StructureInputs,
-            ICTMarketStructureInputs,
-            fetch_ohlcv,
-            _parse_timeframe_to_seconds,
-        )
-    except NameError as e:
-        print("Missing core symbol in indicator:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)  # canonicalized inside
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
-
-    inputs = IndicatorInputs(
-        pullback=pullback,
-        structure=structure,
-        order_flow=order_flow,
-        fvg=fvg,
-        liquidity=liq,
-        demand_supply=ds,
-        order_block=ob,
-        structure_util=utils,
-        ict_structure=ICTMarketStructureInputs(swingSize=int(cfg.swing_size)),
-    )
-
-    # Run loop
-    ex = _build_exchange(cfg.market)
-    alerts_total = 0
-    symbols = symbols[:int(cfg.max_scan)]
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process(candles)
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest = metrics.get("latest_events", {})
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
-            )
-            continue
-
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            cutoff_time = runtime.series.get_time(cutoff_idx)
-            recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-
-        summary = []
-        for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
-            if key in latest:
-                evt = latest[key]
-                disp = evt.get("display", "")
-                status_disp = evt.get("status_display")
-                if status_disp:
-                    disp = f"{disp} [{status_disp}]"
-                direction_hint = _resolve_direction(
-                    evt.get("direction"),
-                    evt.get("direction_display"),
-                    evt.get("status"),
-                    evt.get("text"),
-                    disp,
-                )
-                summary.append(
-                    _colorize_directional_text(
-                        disp,
-                        direction=direction_hint,
-                        fallback=None,
-                    )
-                )
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            if summary:
-                print("  •", " | ".join(summary))
-            for ts, title in recent_alerts[-10:]:
-                ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
-                colored_title = _colorize_directional_text(title)
-                print(f"  - {ts_s} :: {colored_title}")
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
-    return 0
-
-
-
-def _android_cli_entry() -> int:
-    # Android CLI entry: futures-only live scan with Arabic renderer
-    if ccxt is None:
-        print("ccxt not installed. pip install ccxt", file=sys.stderr)
-        return 2
-    cfg, args = _parse_args_android()
-
-    # Build symbols first with strong filters
-    symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-
-    # Core indicator types must exist in the merged file
-    try:
-        SmartMoneyAlgoProE5
-        IndicatorInputs
-        PullbackInputs
-        MarketStructureInputs
-        OrderFlowInputs
-        FVGInputs
-        LiquidityInputs
-        DemandSupplyInputs
-        OrderBlockInputs
-        StructureInputs
-        ICTMarketStructureInputs
-        fetch_ohlcv
-    except NameError as e:
-        print("Missing core symbol in indicator:", e, file=sys.stderr)
-        return 3
-
-    pullback = PullbackInputs(showHL=cfg.showHL, showMn=cfg.showMn)
-    structure = MarketStructureInputs(showSMC=cfg.showSMC, lengSMC=int(cfg.lengSMC), showCircleHL=cfg.showCircleHL)
-    order_flow = OrderFlowInputs(showISOB=cfg.showISOB, showMajoinMiner=cfg.showMajoinMiner)
-    fvg = FVGInputs(show_fvg=cfg.show_fvg)
-    liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
-    ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
-    ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
-    ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
-
-    inputs = IndicatorInputs(
-        pullback=pullback,
-        structure=structure,
-        order_flow=order_flow,
-        fvg=fvg,
-        liquidity=liq,
-        demand_supply=ds,
-        order_block=ob,
-        structure_util=utils,
-        ict_structure=ict,
-    )
-    inputs.console.max_age_bars = max(1, recent_window - 1)
-
-    ex = _build_exchange(cfg.market)
-    alerts_total = 0
-    symbols = symbols[:int(cfg.max_scan)]
-
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process(candles)
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
-            )
-            continue
-
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            try:
-                cutoff_time = runtime.series.get_time(cutoff_idx)
-                recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-            except Exception:
-                pass
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
-    return 0
-
-def __router_main__():
-    import sys
-    # Try to use embedded CLI when available
-    try:
-        use_cli = _should_route_android(sys.argv[1:])
-    except Exception:
-        use_cli = False
-    if use_cli and ('_android_cli_entry' in globals()):
-        try:
-            return _android_cli_entry()
-        except Exception:
-            pass
-    # Fallback to original main() if present
-    try:
-        return main()  # type: ignore
-    except Exception:
-        return 0
-
-
-# ============================================================================
-
-
-
-# === Auto-args when launched from editor (no CLI flags) ====== FUTURES-ONLY ==
-def __editor_autoargs__():
-    import sys
-    if len(sys.argv) == 1:  # no flags -> inject defaults
-        sys.argv += [
-            "-t", "1m", "-l", "600",
-            "--min-change", "5",
-            "--min-volume", "30000000",
-            "--max-scan", "60",
-            "--exclude-patterns", "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME",
-            "--exclude-symbols", "OGUSDT,SHIBUSDT,PEPEUSDT,BONKUSDT",
-            "--verbose"
-        ]
 
 # ========================= Arabic Console Renderer & CLI (Futures-only) =========================
 import sys, time
@@ -10156,6 +10678,19 @@ def _parse_args_android():
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
+    p.add_argument("--workers", type=int, default=6, help="عدد المهام المتوازية لجلب البيانات")
+    p.add_argument(
+        "--stream-poll",
+        type=float,
+        default=1.0,
+        help="الفاصل بالثواني بين تحديثات البث المباشر",
+    )
+    p.add_argument(
+        "--stream-duration",
+        type=float,
+        default=0.0,
+        help="المدة الكلية بالثواني للبث (0 يعني تشغيل مستمر)",
+    )
     args = p.parse_args()
 
     if args.limit <= 0:
@@ -10164,6 +10699,10 @@ def _parse_args_android():
         p.error("--max-symbols must be > 0")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
+    if args.workers <= 0:
+        p.error("--workers يجب أن يكون رقمًا موجبًا")
+    if args.stream_poll < 0:
+        p.error("--stream-poll لا يمكن أن يكون سالبًا")
 
     zone_type = args.zone_type
     if args.use_mother_bar:
@@ -10238,8 +10777,7 @@ def _android_cli_entry() -> int:
     recent_window = max(1, args.recent)
 
     symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-    symbols = list(dict.fromkeys(symbols))
-    ex = _build_exchange('usdtm')
+    symbols = list(dict.fromkeys(symbols))[: int(cfg.max_scan)]
 
     try:
         SmartMoneyAlgoProE5
@@ -10268,62 +10806,41 @@ def _android_cli_entry() -> int:
     ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
 
     inputs = IndicatorInputs(
-        pullback=pullback, structure=structure, order_flow=order_flow,
-        fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
-        structure_util=utils, ict_structure=ict,
+        pullback=pullback,
+        structure=structure,
+        order_flow=order_flow,
+        fvg=fvg,
+        liquidity=liq,
+        demand_supply=ds,
+        order_block=ob,
+        structure_util=utils,
+        ict_structure=ict,
     )
     inputs.console.max_age_bars = max(1, recent_window - 1)
+    inputs.scanner_runtime.mode = "stream"
+    inputs.scanner_runtime.parallel_tasks = max(1, min(args.workers, max(1, len(symbols))))
+    inputs.scanner_runtime.poll_interval_seconds = max(0.1, float(args.stream_poll))
+    if args.stream_duration > 0:
+        inputs.scanner_runtime.stream_duration_seconds = float(args.stream_duration)
+    else:
+        inputs.scanner_runtime.stream_duration_seconds = None
+    inputs.scanner_runtime.max_cycles = None
+    inputs.scanner_runtime.incremental_limit = max(10, int(args.limit))
 
-    alerts_total = 0
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process([{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')} for c in candles])
-        except Exception as e:
-            print(
-                f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                file=sys.stderr,
-            )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=recent_window
+    try:
+        scan_binance(
+            args.timeframe,
+            args.limit,
+            symbols,
+            inputs.scanner_runtime.parallel_tasks,
+            tracer=None,
+            min_daily_change=0.0,
+            inputs=inputs,
+            recent_window_bars=recent_window,
         )
-        if not recent_hits:
-            if recent_window == 1:
-                span_phrase = "آخر شمعة واحدة"
-            elif recent_window == 2:
-                span_phrase = "آخر شمعتين"
-            else:
-                span_phrase = f"آخر {recent_window} شموع"
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-            )
-            continue
-
-        recent_alerts = list(getattr(runtime, "alerts", []))
-        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-            try:
-                cutoff_idx = max(0, runtime.series.length() - recent_window)
-                cutoff_time = runtime.series.get_time(cutoff_idx)
-                if cutoff_time:
-                    recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-            except Exception:
-                pass
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
+    except KeyboardInterrupt:
+        print("\nتم إيقاف البث المباشر يدويًا.")
+        return 0
     return 0
 
 # ---------- Router ----------
