@@ -109,6 +109,45 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+def _classify_alert_direction(
+    key: str,
+    payload: Dict[str, Any],
+    display: str,
+) -> Optional[str]:
+    """Infer an alert direction (bullish/bearish) for richer notifications."""
+
+    direction_fields = (
+        payload.get("direction"),
+        payload.get("side"),
+        payload.get("trend"),
+        payload.get("bias"),
+    )
+    for value in direction_fields:
+        if isinstance(value, str) and value.strip():
+            candidate = value.strip().lower()
+            if any(token in candidate for token in ("bull", "long", "buy")):
+                return "Bullish"
+            if any(token in candidate for token in ("bear", "short", "sell")):
+                return "Bearish"
+
+    text_candidates = [
+        str(key or ""),
+        display or "",
+        str(payload.get("title") or ""),
+        str(payload.get("text") or ""),
+        str(payload.get("label") or ""),
+    ]
+    joined = " ".join(part for part in text_candidates if part)
+    lowered = joined.lower()
+    if lowered:
+        if any(word in lowered for word in ALERT_BULLISH_KEYWORDS):
+            return "Bullish"
+        if any(word in lowered for word in ALERT_BEARISH_KEYWORDS):
+            return "Bearish"
+
+    return None
+
+
 ICT_STRATEGY_RULES: Dict[str, Any] = {
     "strategy": {
         "name": "ICT Multi-Timeframe Sweep OTE",
@@ -9050,7 +9089,15 @@ class AlertDispatcher:
         display = payload.get("display") or payload.get("text") or payload.get("title") or key
         status = payload.get("status_display") or payload.get("status")
         status_segment = f" ({status})" if status else ""
-        line = f"[{ts_display}] {_format_symbol(symbol)} — {key}{status_segment}: {display}"
+        direction = _classify_alert_direction(key, payload, display)
+        if direction:
+            direction_segment = f" [{direction}]"
+        else:
+            direction_segment = ""
+        line = (
+            f"[{ts_display}] {_format_symbol(symbol)} — {key}{status_segment}"
+            f"{direction_segment}: {display}"
+        )
         async with self._print_lock:
             self._sink(line)
 @dataclass
@@ -9199,6 +9246,16 @@ class BinanceUSDMAsyncSession:
     async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
         async with self._semaphore:
             return await self.exchange.fetch_ticker(symbol)
+
+    async def fetch_tickers(
+        self, symbols: Optional[Sequence[str]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        async with self._semaphore:
+            try:
+                return await self.exchange.fetch_tickers(list(symbols) if symbols else None)
+            except TypeError:
+                # Some ccxt exchanges don't accept symbol lists; retry without filter.
+                return await self.exchange.fetch_tickers()
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
         async with self._semaphore:
@@ -9536,6 +9593,20 @@ async def scan_binance_async(
             primary_runtime.process([])
             return primary_runtime, summaries
 
+        try:
+            tickers_snapshot = await session.fetch_tickers(all_symbols)
+        except Exception as exc:
+            print(
+                f"تعذر جلب بيانات tickers المجمعة؛ سيتم استخدام قيم افتراضية: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            tickers_snapshot = {}
+
+        ticker_cache: Dict[str, Dict[str, Any]] = {
+            symbol: tickers_snapshot.get(symbol, {}) for symbol in all_symbols
+        }
+
         print_lock = asyncio.Lock()
         tracer_lock = asyncio.Lock()
         dispatcher = AlertDispatcher(print_lock)
@@ -9546,17 +9617,7 @@ async def scan_binance_async(
         async def process_symbol(
             idx: int, symbol: str
         ) -> Tuple[int, Optional[Dict[str, Any]], Optional[SmartMoneyAlgoProE5]]:
-            try:
-                ticker = await session.fetch_ticker(symbol)
-            except Exception as exc:
-                async with print_lock:
-                    print(
-                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                return idx, None, None
-
+            ticker = ticker_cache.get(symbol) or {}
             daily_change = _extract_daily_change_percent(ticker)
             if (
                 min_daily_change > 0.0
