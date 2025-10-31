@@ -1683,6 +1683,10 @@ class SmartMoneyAlgoProE5:
                     }
                     if extra:
                         payload.update(extra)
+                    if key in events:
+                        merged_payload = events[key].copy()
+                        merged_payload.update(payload)
+                        payload = merged_payload
                     events[key] = payload
                     break
 
@@ -1705,7 +1709,7 @@ class SmartMoneyAlgoProE5:
                     if not self._console_event_within_age(bx.left):
                         continue
                     if predicate(bx):
-                        events[key] = {
+                        payload = {
                             "text": bx.text,
                             "price": (bx.bottom, bx.top),
                             "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
@@ -1717,6 +1721,11 @@ class SmartMoneyAlgoProE5:
                                 self.BOX_STATUS_LABELS.get("active", "active"),
                             ),
                         }
+                        if key in events:
+                            merged_payload = events[key].copy()
+                            merged_payload.update(payload)
+                            payload = merged_payload
+                        events[key] = payload
                         return
 
         bull_color = self.inputs.structure.bull
