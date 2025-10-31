@@ -162,6 +162,31 @@ class CustomPoint:
 
 
 @dataclass
+class SupportResistanceLevel:
+    """State bundle for a clustered support/resistance level."""
+
+    rs_type: str
+    timeframe: str
+    price: float
+    points: List[CustomPoint] = field(default_factory=list)
+    line: Optional["Line"] = None
+    box: Optional["Box"] = None
+    price_label: Optional["Label"] = None
+    break_label: Optional["Label"] = None
+    break_line: Optional["Line"] = None
+    break_box: Optional["Box"] = None
+    retest_labels: List["Label"] = field(default_factory=list)
+    is_broken: bool = False
+    broken_time: Optional[int] = None
+    break_level: float = NA
+    break_tr: float = 0.0
+    last_retest_bar: Optional[int] = None
+    last_retest_time: Optional[int] = None
+    last_break_alert_time: Optional[int] = None
+    last_retest_alert_time: Optional[int] = None
+
+
+@dataclass
 class MarketStructureInputs:
     showSMC: bool = True
     lengSMC: int = 40
