@@ -8482,7 +8482,11 @@ def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: 
                 )
             pending_list = payload.get("pending_conditions") or []
             if pending_list:
-                pending_text = ", ".join(str(item) for item in pending_list)
+                pending_items = [
+                    _strip_condition_prefix(item) if isinstance(item, str) else str(item)
+                    for item in pending_list
+                ]
+                pending_text = ", ".join(pending_items)
                 print(f"    الشروط الناقصة: {pending_text}", flush=True)
             ote_range_payload = payload.get("ote_range")
             if isinstance(ote_range_payload, (list, tuple)) and len(ote_range_payload) == 2:
@@ -9002,12 +9006,41 @@ def _describe_zone_match(match: Optional[Dict[str, Any]], source: Optional[str])
     return f"مطابقة داخل {source_label}: {range_text}"
 
 
+_CONDITION_PREFIX_RE = re.compile(r"^الشرط\s+\d+:\s*")
+
+
+def _strip_condition_prefix(name: str) -> str:
+    if not isinstance(name, str):
+        return str(name)
+    return _CONDITION_PREFIX_RE.sub("", name, count=1).strip() or name
+
+
 def _summarise_pending_conditions(pending: Sequence[str]) -> str:
     if not pending:
         return "جميع الشروط مكتملة"
-    if len(pending) == 1:
-        return f"بانتظار شرط واحد: {pending[0]}"
-    return "بانتظار الشروط: " + ", ".join(pending)
+    cleaned = [_strip_condition_prefix(item) for item in pending]
+    if len(cleaned) == 1:
+        return f"بانتظار الشرط التالي: {cleaned[0]}"
+    return "بانتظار الشروط التالية: " + ", ".join(cleaned)
+
+
+def _evaluate_condition_sequence(
+    steps: Sequence[Tuple[str, Callable[[], Tuple[bool, str]]]]
+) -> Tuple[List[ICTConditionStatus], List[str], str]:
+    conditions: List[ICTConditionStatus] = []
+    pending_labels: List[str] = []
+    for idx, (title, evaluator) in enumerate(steps, 1):
+        try:
+            met, detail = evaluator()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            met = False
+            detail = f"تعذر تقييم الشرط: {exc}"
+        label = f"الشرط {idx}: {title}"
+        conditions.append(ICTConditionStatus(name=label, met=bool(met), detail=detail))
+        if not met:
+            pending_labels.append(label)
+    summary = _summarise_pending_conditions(pending_labels)
+    return conditions, pending_labels, summary
 
 
 def _extract_golden_zone(runtime: Any) -> Tuple[Optional[Tuple[float, float]], int]:
@@ -9123,39 +9156,6 @@ def detect_ict_strategy(
             if isinstance(price_payload, (list, tuple)) and len(price_payload) == 2:
                 ote_range = _normalise_price_range(price_payload[0], price_payload[1])
 
-    if require_ote and ote_range is None:
-        evaluations.append(
-            ICTConditionEvaluation(
-                direction="long",
-                conditions=[
-                    ICTConditionStatus(
-                        name="نطاق OTE متاح",
-                        met=False,
-                        detail="لم يتم تحديد Golden Zone في الإطار المنخفض",
-                    )
-                ],
-                all_met=False,
-                summary="بانتظار تحديد نطاق OTE",
-                pending_conditions=["نطاق OTE متاح"],
-            )
-        )
-        evaluations.append(
-            ICTConditionEvaluation(
-                direction="short",
-                conditions=[
-                    ICTConditionStatus(
-                        name="نطاق OTE متاح",
-                        met=False,
-                        detail="لم يتم تحديد Golden Zone في الإطار المنخفض",
-                    )
-                ],
-                all_met=False,
-                summary="بانتظار تحديد نطاق OTE",
-                pending_conditions=["نطاق OTE متاح"],
-            )
-        )
-        return matches, evaluations
-
     effective_ote_range = ote_range
     if effective_ote_range is None and not require_ote and price_value is not None:
         effective_ote_range = (price_value, price_value)
@@ -9228,78 +9228,53 @@ def detect_ict_strategy(
             )
         )
 
-    long_conditions: List[ICTConditionStatus] = []
-    long_conditions.append(
-        ICTConditionStatus(
-            name=f"حدث هيكلي صاعد على {htf_tf}",
-            met=bullish_event is not None,
-            detail=_describe_structure_event(bullish_event, "صاعد"),
-        )
-    )
-    if require_liquidity_sweep:
-        long_conditions.append(
-            ICTConditionStatus(
-                name="سحب سيولة بيعي (sell-side)",
-                met=sweep_sell is not None,
-                detail=_describe_sweep_event(sweep_sell, "sell-side"),
-            )
-        )
-    else:
-        long_conditions.append(
-            ICTConditionStatus(
-                name="سحب سيولة بيعي (sell-side)",
-                met=True,
-                detail="الشرط معطل في الإعدادات",
-            )
-        )
-    long_conditions.append(
-        ICTConditionStatus(
-            name="نطاق OTE متاح",
-            met=effective_ote_range is not None,
-            detail=(
-                f"{format_price(effective_ote_range[0])} → {format_price(effective_ote_range[1])}"
-                if effective_ote_range is not None
-                else "لم يتم تحديد Golden Zone"
-            ),
-        )
-    )
-    long_conditions.append(
-        ICTConditionStatus(
-            name="تطابق منطقة طلب/FVG",
-            met=zone_match_long is not None,
-            detail=_describe_zone_match(zone_match_long, zone_source_long),
-        )
-    )
-    long_conditions.append(
-        ICTConditionStatus(
-            name="الاتجاه الذهبي يدعم الصعود",
-            met=golden_direction >= 0,
-            detail=(
-                "الاتجاه الذهبي يشير لصعود أو حياد"
-                if golden_direction >= 0
-                else "الاتجاه الذهبي يشير لضغط هابط"
-            ),
-        )
-    )
-    long_conditions.append(
-        ICTConditionStatus(
-            name="سعر التنفيذ متوفر",
-            met=price_value is not None,
-            detail=(
-                f"السعر الحالي {format_price(price_value)}"
-                if price_value is not None
-                else "لم يتوفر سعر إغلاق حديث"
-            ),
-        )
-    )
-    pending_long = [cond.name for cond in long_conditions if not cond.met]
+    def _long_structure_status() -> Tuple[bool, str]:
+        return bool(bullish_event), _describe_structure_event(bullish_event, "صاعد")
+
+    def _long_sweep_status() -> Tuple[bool, str]:
+        if not require_liquidity_sweep:
+            return True, "الشرط معطل في الإعدادات"
+        return sweep_sell is not None, _describe_sweep_event(sweep_sell, "sell-side")
+
+    def _long_ote_status() -> Tuple[bool, str]:
+        if effective_ote_range is not None:
+            return True, f"{format_price(effective_ote_range[0])} → {format_price(effective_ote_range[1])}"
+        detail = "لم يتم تحديد Golden Zone" if require_ote else "لم يتم حساب نطاق OTE بعد"
+        return False, detail
+
+    def _long_zone_status() -> Tuple[bool, str]:
+        if not allow_order_block and not allow_fvg:
+            return False, "تم تعطيل مصادر المناطق (OB/FVG)"
+        return zone_match_long is not None, _describe_zone_match(zone_match_long, zone_source_long)
+
+    def _long_golden_status() -> Tuple[bool, str]:
+        if golden_direction >= 0:
+            return True, "الاتجاه الذهبي يشير لصعود أو حياد"
+        return False, "الاتجاه الذهبي يشير لضغط هابط"
+
+    def _long_price_status() -> Tuple[bool, str]:
+        if price_value is not None:
+            return True, f"السعر الحالي {format_price(price_value)}"
+        return False, "لم يتوفر سعر إغلاق حديث"
+
+    long_steps: List[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
+        (f"حدث هيكلي صاعد على {htf_tf}", _long_structure_status),
+        ("سحب سيولة بيعي (sell-side)", _long_sweep_status),
+        ("نطاق OTE متاح", _long_ote_status),
+        ("تطابق منطقة طلب/FVG", _long_zone_status),
+        ("الاتجاه الذهبي يدعم الصعود", _long_golden_status),
+        ("سعر التنفيذ متوفر", _long_price_status),
+    ]
+
+    long_conditions, pending_long_labels, long_summary = _evaluate_condition_sequence(long_steps)
+    pending_long_clean = [_strip_condition_prefix(name) for name in pending_long_labels]
     evaluations.append(
         ICTConditionEvaluation(
             direction="long",
             conditions=long_conditions,
-            all_met=len(pending_long) == 0,
-            summary=_summarise_pending_conditions(pending_long),
-            pending_conditions=pending_long,
+            all_met=len(pending_long_labels) == 0,
+            summary=long_summary,
+            pending_conditions=pending_long_clean,
             ote_range=effective_ote_range,
         )
     )
@@ -9364,78 +9339,53 @@ def detect_ict_strategy(
             )
         )
 
-    short_conditions: List[ICTConditionStatus] = []
-    short_conditions.append(
-        ICTConditionStatus(
-            name=f"حدث هيكلي هابط على {htf_tf}",
-            met=bearish_event is not None,
-            detail=_describe_structure_event(bearish_event, "هابط"),
-        )
-    )
-    if require_liquidity_sweep:
-        short_conditions.append(
-            ICTConditionStatus(
-                name="سحب سيولة شرائي (buy-side)",
-                met=sweep_buy is not None,
-                detail=_describe_sweep_event(sweep_buy, "buy-side"),
-            )
-        )
-    else:
-        short_conditions.append(
-            ICTConditionStatus(
-                name="سحب سيولة شرائي (buy-side)",
-                met=True,
-                detail="الشرط معطل في الإعدادات",
-            )
-        )
-    short_conditions.append(
-        ICTConditionStatus(
-            name="نطاق OTE متاح",
-            met=effective_ote_range is not None,
-            detail=(
-                f"{format_price(effective_ote_range[0])} → {format_price(effective_ote_range[1])}"
-                if effective_ote_range is not None
-                else "لم يتم تحديد Golden Zone"
-            ),
-        )
-    )
-    short_conditions.append(
-        ICTConditionStatus(
-            name="تطابق منطقة عرض/FVG",
-            met=zone_match_short is not None,
-            detail=_describe_zone_match(zone_match_short, zone_source_short),
-        )
-    )
-    short_conditions.append(
-        ICTConditionStatus(
-            name="الاتجاه الذهبي يدعم الهبوط",
-            met=golden_direction <= 0,
-            detail=(
-                "الاتجاه الذهبي يشير لهبوط أو حياد"
-                if golden_direction <= 0
-                else "الاتجاه الذهبي يشير لضغط صاعد"
-            ),
-        )
-    )
-    short_conditions.append(
-        ICTConditionStatus(
-            name="سعر التنفيذ متوفر",
-            met=price_value is not None,
-            detail=(
-                f"السعر الحالي {format_price(price_value)}"
-                if price_value is not None
-                else "لم يتوفر سعر إغلاق حديث"
-            ),
-        )
-    )
-    pending_short = [cond.name for cond in short_conditions if not cond.met]
+    def _short_structure_status() -> Tuple[bool, str]:
+        return bool(bearish_event), _describe_structure_event(bearish_event, "هابط")
+
+    def _short_sweep_status() -> Tuple[bool, str]:
+        if not require_liquidity_sweep:
+            return True, "الشرط معطل في الإعدادات"
+        return sweep_buy is not None, _describe_sweep_event(sweep_buy, "buy-side")
+
+    def _short_ote_status() -> Tuple[bool, str]:
+        if effective_ote_range is not None:
+            return True, f"{format_price(effective_ote_range[0])} → {format_price(effective_ote_range[1])}"
+        detail = "لم يتم تحديد Golden Zone" if require_ote else "لم يتم حساب نطاق OTE بعد"
+        return False, detail
+
+    def _short_zone_status() -> Tuple[bool, str]:
+        if not allow_order_block and not allow_fvg:
+            return False, "تم تعطيل مصادر المناطق (OB/FVG)"
+        return zone_match_short is not None, _describe_zone_match(zone_match_short, zone_source_short)
+
+    def _short_golden_status() -> Tuple[bool, str]:
+        if golden_direction <= 0:
+            return True, "الاتجاه الذهبي يشير لهبوط أو حياد"
+        return False, "الاتجاه الذهبي يشير لضغط صاعد"
+
+    def _short_price_status() -> Tuple[bool, str]:
+        if price_value is not None:
+            return True, f"السعر الحالي {format_price(price_value)}"
+        return False, "لم يتوفر سعر إغلاق حديث"
+
+    short_steps: List[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
+        (f"حدث هيكلي هابط على {htf_tf}", _short_structure_status),
+        ("سحب سيولة شرائي (buy-side)", _short_sweep_status),
+        ("نطاق OTE متاح", _short_ote_status),
+        ("تطابق منطقة عرض/FVG", _short_zone_status),
+        ("الاتجاه الذهبي يدعم الهبوط", _short_golden_status),
+        ("سعر التنفيذ متوفر", _short_price_status),
+    ]
+
+    short_conditions, pending_short_labels, short_summary = _evaluate_condition_sequence(short_steps)
+    pending_short_clean = [_strip_condition_prefix(name) for name in pending_short_labels]
     evaluations.append(
         ICTConditionEvaluation(
             direction="short",
             conditions=short_conditions,
-            all_met=len(pending_short) == 0,
-            summary=_summarise_pending_conditions(pending_short),
-            pending_conditions=pending_short,
+            all_met=len(pending_short_labels) == 0,
+            summary=short_summary,
+            pending_conditions=pending_short_clean,
             ote_range=effective_ote_range,
         )
     )
