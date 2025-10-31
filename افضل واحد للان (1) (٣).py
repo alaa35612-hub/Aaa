@@ -7490,56 +7490,46 @@ def fetch_binance_usdtm_symbols(
 
 
 def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
-    """Fetch OHLCV data while preserving full history for structural parity.
+    """Fetch OHLCV data while respecting the desired lookback window.
 
-    Binance USDT-M returns at most 1500 candles per request.  TradingView keeps
-    indicator state across the entire available history, so requesting only the
-    latest ``limit`` bars leads to structural mismatches (missing legacy
-    pullbacks/ChoCh/OB states).  To replicate the indicator faithfully we walk
-    the history from the earliest candle and keep the trailing slice when the
-    caller specifies ``limit``.  Passing ``limit<=0`` fetches the entire
-    available history.
+    The previous implementation attempted to rebuild the entire history by
+    looping from ``since=0`` which is prohibitively slow for futures markets
+    that contain several years of data.  For the ICT scanner we only need a
+    well-defined recent window, therefore this helper now requests the latest
+    candles in a single call and trims the response if the exchange returns
+    more data than requested.
     """
 
-    timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
-    timeframe_ms = timeframe_seconds * 1000
     max_batch = 1500
-    since = 0
-    candles: List[Dict[str, float]] = []
-    target = limit if limit > 0 else None
-
-    while True:
+    request_limit = max_batch if limit <= 0 else int(limit)
+    if request_limit <= 0:
         request_limit = max_batch
-        if target is not None and target < max_batch and not candles:
-            # first batch can be trimmed if the caller only needs a small window
-            request_limit = target
-        raw: List[List[float]]
-        if since <= 0:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        else:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
-        if not raw:
-            break
-        for entry in raw:
-            candles.append(
-                {
-                    "time": entry[0],
-                    "open": entry[1],
-                    "high": entry[2],
-                    "low": entry[3],
-                    "close": entry[4],
-                    "volume": entry[5],
-                }
-            )
-        if target is not None and len(candles) > target:
-            candles = candles[-target:]
-        last_open = raw[-1][0]
-        next_since = last_open + timeframe_ms
-        if len(raw) < request_limit:
-            break
-        if next_since <= since:
-            next_since = since + timeframe_ms
-        since = next_since
+
+    try:
+        raw: List[List[float]] = exchange.fetch_ohlcv(
+            symbol,
+            timeframe=timeframe,
+            limit=request_limit,
+        )
+    except Exception:
+        # Propagate fetch errors to the caller so the scanner can report them.
+        raise
+
+    candles: List[Dict[str, float]] = [
+        {
+            "time": entry[0],
+            "open": entry[1],
+            "high": entry[2],
+            "low": entry[3],
+            "close": entry[4],
+            "volume": entry[5],
+        }
+        for entry in raw
+    ]
+
+    if limit > 0 and len(candles) > limit:
+        candles = candles[-limit:]
+
     return candles
 
 
@@ -9138,6 +9128,11 @@ def scan_binance(
     )
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
+    try:
+        tickers_map = exchange.fetch_tickers(all_symbols)
+    except Exception:
+        tickers_map = {}
+
     summaries: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
     window = recent_window_bars
@@ -9155,7 +9150,9 @@ def scan_binance(
     matches_found = 0
     for idx, symbol in enumerate(all_symbols, 1):
         try:
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = tickers_map.get(symbol) if isinstance(tickers_map, dict) else None
+            if not ticker:
+                ticker = exchange.fetch_ticker(symbol)
         except Exception as exc:
             print(
                 f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
