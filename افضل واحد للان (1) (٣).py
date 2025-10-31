@@ -43,6 +43,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     ccxt = None  # type: ignore
 
+try:  # Python >=3.9
+    from zoneinfo import ZoneInfo  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    ZoneInfo = None  # type: ignore
+
 
 # ----------------------------------------------------------------------------
 # Pine compatibility helpers
@@ -105,10 +110,14 @@ class ICTStrategySettings:
     higher_lookback: int = 400
     lower_lookback: int = 1200
     ote_ratio: Tuple[float, float] = (0.62, 0.79)
+    prefer_ote: bool = True
+    require_ote: bool = False
     require_liquidity_sweep: bool = True
-    require_ote: bool = True
     allow_order_block: bool = True
     allow_fvg: bool = True
+    risk_per_trade: float = 0.01
+    use_silver_bullet: bool = True
+    use_killzones: bool = True
 
 
 @dataclass
@@ -136,6 +145,147 @@ ICT_STRATEGY_SETTINGS = ICTStrategySettings()
 ICT_SCANNER_SETTINGS = ICTScannerSettings()
 ICT_PERFORMANCE_SETTINGS = ICTPerformanceSettings()
 
+ICT_SETTINGS: Dict[str, Any] = {
+    "enabled": ICT_STRATEGY_SETTINGS.enabled,
+    "higher_timeframe": ICT_STRATEGY_SETTINGS.higher_timeframe,
+    "lower_timeframe": ICT_STRATEGY_SETTINGS.lower_timeframe,
+    "ote_range": ICT_STRATEGY_SETTINGS.ote_ratio,
+    "prefer_ote": ICT_STRATEGY_SETTINGS.prefer_ote,
+    "require_ote": ICT_STRATEGY_SETTINGS.require_ote,
+    "require_liquidity_sweep": ICT_STRATEGY_SETTINGS.require_liquidity_sweep,
+    "allow_fvg": ICT_STRATEGY_SETTINGS.allow_fvg,
+    "allow_order_block": ICT_STRATEGY_SETTINGS.allow_order_block,
+    "risk_per_trade": ICT_STRATEGY_SETTINGS.risk_per_trade,
+    "use_silver_bullet": ICT_STRATEGY_SETTINGS.use_silver_bullet,
+    "use_killzones": ICT_STRATEGY_SETTINGS.use_killzones,
+}
+
+KILLZONES_NY: Dict[str, Tuple[datetime.time, datetime.time]] = {
+    "london": (datetime.time(3, 0), datetime.time(4, 0)),
+    "silver_am": (datetime.time(10, 0), datetime.time(11, 0)),
+    "ny_pm": (datetime.time(14, 0), datetime.time(15, 0)),
+}
+
+ICT_RULES: Dict[str, Any] = {
+    "bias": {
+        "long": {"need": ["htf_bullish_bias"]},
+        "short": {"need": ["htf_bearish_bias"]},
+    },
+    "ltf_confirmation": {
+        "need": ["liquidity_sweep", "displacement_or_mss"],
+        "nice_to_have": ["fvg_marked"],
+    },
+    "entry_zones": {
+        "long": {"any": ["bullish_fvg", "demand_ob", "in_ote"]},
+        "short": {"any": ["bearish_fvg", "supply_ob", "in_ote"]},
+    },
+}
+
+ENTRY_WEIGHTS: Dict[str, float] = {
+    "bullish_fvg": 2.5,
+    "bearish_fvg": 2.5,
+    "demand_ob": 1.5,
+    "supply_ob": 1.5,
+    "in_ote": 1.0 if ICT_SETTINGS["prefer_ote"] else 0.0,
+    "mss_tag": 0.5,
+    "session_ok": 0.5,
+}
+
+MIN_SCORE_LONG = 2.5
+MIN_SCORE_SHORT = 2.5
+
+
+def in_killzone_now(now_utc: Optional[datetime.datetime] = None) -> bool:
+    if not ICT_SETTINGS.get("use_killzones", True):
+        return True
+    now_utc = now_utc or datetime.datetime.utcnow()
+    if ZoneInfo is None:
+        return True
+    ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    now_time = ny.time()
+    for name, (start, end) in KILLZONES_NY.items():
+        if name.startswith("silver") and not ICT_SETTINGS.get("use_silver_bullet", True):
+            continue
+        if start <= now_time <= end:
+            return True
+    return False
+
+
+def score_entry(side: str, facts: Mapping[str, bool]) -> Tuple[float, Dict[str, float]]:
+    if side == "long" and not facts.get("htf_bullish_bias", False):
+        return 0.0, {}
+    if side == "short" and not facts.get("htf_bearish_bias", False):
+        return 0.0, {}
+
+    if ICT_SETTINGS.get("require_liquidity_sweep", True) and not facts.get("liquidity_sweep", False):
+        return 0.0, {}
+    if not facts.get("displacement_or_mss", False):
+        return 0.0, {}
+
+    if ICT_SETTINGS.get("require_ote", False) and not facts.get("in_ote", False):
+        return 0.0, {}
+
+    entry_keys = ICT_RULES["entry_zones"][side]["any"]
+    if not any(facts.get(key, False) for key in entry_keys):
+        return 0.0, {}
+
+    detail: Dict[str, float] = {}
+    total = 0.0
+    for key in entry_keys:
+        if facts.get(key, False):
+            weight = ENTRY_WEIGHTS.get(key, 0.0)
+            if weight:
+                detail[key] = weight
+            total += weight
+
+    if facts.get("displacement_or_mss", False):
+        bonus = ENTRY_WEIGHTS.get("mss_tag", 0.0)
+        if bonus:
+            detail["mss_tag"] = bonus
+            total += bonus
+    if in_killzone_now():
+        bonus = ENTRY_WEIGHTS.get("session_ok", 0.0)
+        if bonus:
+            detail["session_ok"] = bonus
+            total += bonus
+
+    return total, detail
+
+
+def pass_threshold(side: str, score: float) -> bool:
+    threshold = MIN_SCORE_LONG if side == "long" else MIN_SCORE_SHORT
+    return score >= threshold
+
+
+def should_enter_long(facts: Mapping[str, bool]) -> Dict[str, Any]:
+    score, detail = score_entry("long", facts)
+    return {
+        "side": "long",
+        "decision": pass_threshold("long", score),
+        "score": round(score, 2),
+        "reasons": sorted(detail.items(), key=lambda item: -item[1]),
+        "risk": {
+            "stop_basis": "behind_sweep_low",
+            "tp_basis": "next_liquidity_pool",
+            "risk_per_trade": ICT_SETTINGS.get("risk_per_trade", ICT_STRATEGY_SETTINGS.risk_per_trade),
+        },
+    }
+
+
+def should_enter_short(facts: Mapping[str, bool]) -> Dict[str, Any]:
+    score, detail = score_entry("short", facts)
+    return {
+        "side": "short",
+        "decision": pass_threshold("short", score),
+        "score": round(score, 2),
+        "reasons": sorted(detail.items(), key=lambda item: -item[1]),
+        "risk": {
+            "stop_basis": "behind_sweep_high",
+            "tp_basis": "next_liquidity_pool",
+            "risk_per_trade": ICT_SETTINGS.get("risk_per_trade", ICT_STRATEGY_SETTINGS.risk_per_trade),
+        },
+    }
+
 
 ICT_STRATEGY_RULES: Dict[str, Any] = {
     "strategy": {
@@ -147,14 +297,14 @@ ICT_STRATEGY_RULES: Dict[str, Any] = {
                 "htf_trend": "Bullish BOS on 15m (uptrend structure confirmed)",
                 "ltf_conditions": [
                     "Sell-side liquidity sweep on 1m (price sweeps a prior low then rebounds)",
-                    "Retracement into a bullish FVG or demand OB within OTE zone (62%-79% retracement)",
+                    "Retracement into a bullish FVG or demand OB with optional OTE (62%-79% preferred)",
                 ],
             },
             "short_setup": {
                 "htf_trend": "Bearish BOS أو CHOCH على 15m (هيكل هابط)",
                 "ltf_conditions": [
                     "Buy-side liquidity sweep on 1m (price sweeps a prior high then reverses)",
-                    "Retracement into a bearish FVG or supply OB within OTE zone (62%-79% retracement)",
+                    "Retracement into a bearish FVG or supply OB with optional OTE (62%-79% preferred)",
                 ],
             },
         },
@@ -170,10 +320,14 @@ ICT_STRATEGY_RULES: Dict[str, Any] = {
         "htf_lookback": ICT_STRATEGY_SETTINGS.higher_lookback,
         "ltf_lookback": ICT_STRATEGY_SETTINGS.lower_lookback,
         "ote_ratio": ICT_STRATEGY_SETTINGS.ote_ratio,
+        "prefer_ote": ICT_STRATEGY_SETTINGS.prefer_ote,
         "require_liquidity_sweep": ICT_STRATEGY_SETTINGS.require_liquidity_sweep,
         "require_ote": ICT_STRATEGY_SETTINGS.require_ote,
         "allow_order_block": ICT_STRATEGY_SETTINGS.allow_order_block,
         "allow_fvg": ICT_STRATEGY_SETTINGS.allow_fvg,
+        "risk_per_trade": ICT_STRATEGY_SETTINGS.risk_per_trade,
+        "use_killzones": ICT_STRATEGY_SETTINGS.use_killzones,
+        "use_silver_bullet": ICT_STRATEGY_SETTINGS.use_silver_bullet,
     },
     "performance": {
         "metric": ICT_PERFORMANCE_SETTINGS.metric_name,
@@ -8679,15 +8833,16 @@ def _collect_recent_event_hits(
 class ICTStrategyMatch:
     direction: str
     setup: str
-    ote_range: Tuple[float, float]
     price: float
     timeframe_alignment: Tuple[str, str]
+    ote_range: Optional[Tuple[float, float]] = None
     reasons: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         payload = dataclasses.asdict(self)
-        payload["ote_range"] = list(self.ote_range)
+        if self.ote_range is not None:
+            payload["ote_range"] = list(self.ote_range)
         payload["timeframe_alignment"] = list(self.timeframe_alignment)
         # Provide an explicit alias so downstream consumers can label the price
         # column as an entry level without guessing the semantic meaning.
@@ -8939,26 +9094,27 @@ def _collect_fvg_boxes(runtime: Any, bullish: bool) -> List[Box]:
 
 def _find_zone_match(
     boxes: Sequence[Box],
-    ote_range: Optional[Tuple[float, float]],
     price: Optional[float],
+    ote_range: Optional[Tuple[float, float]] = None,
 ) -> Optional[Dict[str, Any]]:
-    if ote_range is None or price is None:
+    if price is None:
         return None
     for box in boxes:
         zone_range = _normalise_price_range(box.bottom, box.top)
         if zone_range is None:
             continue
-        if not _ranges_intersect(zone_range, ote_range):
-            continue
         if not _price_in_range(price, zone_range):
             continue
-        return {
+        payload = {
             "range": list(zone_range),
             "left": box.left,
             "right": box.right,
             "top": box.top,
             "bottom": box.bottom,
         }
+        if ote_range is not None:
+            payload["ote_overlap"] = _ranges_intersect(zone_range, ote_range)
+        return payload
 
 
 def _describe_structure_event(event: Optional[Dict[str, Any]], direction_hint: str) -> str:
@@ -8982,11 +9138,46 @@ def _describe_sweep_event(event: Optional[Dict[str, Any]], side: str) -> str:
     level = event.get("price")
     price_text: str
     if isinstance(level, (list, tuple)) and len(level) == 2:
-        price_text = " → ".join(format_price(x if isinstance(x, (int, float)) else None) for x in level)
+        price_text = " → ".join(
+            format_price(x if isinstance(x, (int, float)) else None) for x in level
+        )
     else:
         price_text = format_price(level if isinstance(level, (int, float)) else None)
     timestamp = format_timestamp(event.get("time"))
     return f"سحب سيولة {side} عند {price_text} ({timestamp})"
+
+
+def _extract_displacement_event(events: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(events, Mapping):
+        return None
+    displacement_keys = ("MSS+", "MSS", "MSS-", "Displacement", "BOS+", "MSS")
+    for key in displacement_keys:
+        payload = events.get(key)
+        if isinstance(payload, dict):
+            enriched = dict(payload)
+            enriched.setdefault("key", key)
+            return enriched
+    for key, payload in events.items():
+        if "mss" in str(key).lower() and isinstance(payload, dict):
+            enriched = dict(payload)
+            enriched.setdefault("key", key)
+            return enriched
+    return None
+
+
+def _describe_displacement_event(event: Optional[Dict[str, Any]], fallback: Optional[str] = None) -> str:
+    if isinstance(event, dict):
+        label = event.get("text") or event.get("label") or event.get("key") or "MSS"
+        price = event.get("price")
+        price_text = format_price(price if isinstance(price, (int, float)) else None)
+        timestamp = format_timestamp(event.get("time"))
+        parts = [label]
+        if price_text and price_text != "—":
+            parts.append(f"@ {price_text}")
+        if timestamp and timestamp != "—":
+            parts.append(timestamp)
+        return " ".join(parts)
+    return fallback or "لم يتم رصد اندفاع (MSS/Displacement) بعد"
 
 
 def _describe_zone_match(match: Optional[Dict[str, Any]], source: Optional[str]) -> str:
@@ -9090,19 +9281,37 @@ def detect_ict_strategy(
 ) -> Tuple[List[ICTStrategyMatch], List[ICTConditionEvaluation]]:
     matches: List[ICTStrategyMatch] = []
     evaluations: List[ICTConditionEvaluation] = []
-    if not ICT_STRATEGY_SETTINGS.enabled:
+    if not ICT_SETTINGS.get("enabled", True):
         return matches, evaluations
     runtime_cfg = config.get("runtime", {}) if isinstance(config, dict) else {}
     htf_tf = runtime_cfg.get("htf_timeframe", ICT_STRATEGY_SETTINGS.higher_timeframe)
     ltf_tf = runtime_cfg.get("ltf_timeframe", ICT_STRATEGY_SETTINGS.lower_timeframe)
     htf_limit = int(runtime_cfg.get("htf_lookback", ICT_STRATEGY_SETTINGS.higher_lookback) or ICT_STRATEGY_SETTINGS.higher_lookback)
     ltf_limit = int(runtime_cfg.get("ltf_lookback", ICT_STRATEGY_SETTINGS.lower_lookback) or ICT_STRATEGY_SETTINGS.lower_lookback)
-    require_liquidity_sweep = bool(
-        runtime_cfg.get("require_liquidity_sweep", ICT_STRATEGY_SETTINGS.require_liquidity_sweep)
+    prefer_ote = bool(runtime_cfg.get("prefer_ote", ICT_SETTINGS.get("prefer_ote", True)))
+    require_ote = bool(runtime_cfg.get("require_ote", ICT_SETTINGS.get("require_ote", False)))
+    require_liquidity_sweep = bool(runtime_cfg.get("require_liquidity_sweep", ICT_SETTINGS.get("require_liquidity_sweep", True)))
+    allow_order_block = bool(runtime_cfg.get("allow_order_block", ICT_SETTINGS.get("allow_order_block", True)))
+    allow_fvg = bool(runtime_cfg.get("allow_fvg", ICT_SETTINGS.get("allow_fvg", True)))
+    risk_per_trade = float(runtime_cfg.get("risk_per_trade", ICT_SETTINGS.get("risk_per_trade", 0.01)))
+    use_killzones = bool(runtime_cfg.get("use_killzones", ICT_SETTINGS.get("use_killzones", True)))
+    use_silver_bullet = bool(runtime_cfg.get("use_silver_bullet", ICT_SETTINGS.get("use_silver_bullet", True)))
+
+    ICT_SETTINGS.update(
+        {
+            "higher_timeframe": htf_tf,
+            "lower_timeframe": ltf_tf,
+            "prefer_ote": prefer_ote,
+            "require_ote": require_ote,
+            "require_liquidity_sweep": require_liquidity_sweep,
+            "allow_order_block": allow_order_block,
+            "allow_fvg": allow_fvg,
+            "risk_per_trade": risk_per_trade,
+            "use_killzones": use_killzones,
+            "use_silver_bullet": use_silver_bullet,
+        }
     )
-    require_ote = bool(runtime_cfg.get("require_ote", ICT_STRATEGY_SETTINGS.require_ote))
-    allow_order_block = bool(runtime_cfg.get("allow_order_block", ICT_STRATEGY_SETTINGS.allow_order_block))
-    allow_fvg = bool(runtime_cfg.get("allow_fvg", ICT_STRATEGY_SETTINGS.allow_fvg))
+    ENTRY_WEIGHTS["in_ote"] = 1.0 if ICT_SETTINGS.get("prefer_ote", True) else 0.0
 
     try:
         htf_candles = _candles_from_cache(candles_cache, htf_tf)
@@ -9155,17 +9364,13 @@ def detect_ict_strategy(
     else:
         price_value = None
 
-    ote_range, golden_direction = _extract_golden_zone(runtime_ltf)
+    ote_range, _ = _extract_golden_zone(runtime_ltf)
     if ote_range is None:
         zone_event = ltf_events.get("GOLDEN_ZONE") if isinstance(ltf_events, dict) else None
         if isinstance(zone_event, dict):
             price_payload = zone_event.get("price")
             if isinstance(price_payload, (list, tuple)) and len(price_payload) == 2:
                 ote_range = _normalise_price_range(price_payload[0], price_payload[1])
-
-    effective_ote_range = ote_range
-    if effective_ote_range is None and not require_ote and price_value is not None:
-        effective_ote_range = (price_value, price_value)
 
     sweep_event = ltf_events.get("X") if isinstance(ltf_events, dict) else None
 
@@ -9174,9 +9379,12 @@ def detect_ict_strategy(
     bullish_fvg_boxes = _collect_fvg_boxes(runtime_ltf, True)
     bearish_fvg_boxes = _collect_fvg_boxes(runtime_ltf, False)
 
-    # Long setup ------------------------------------------------------------
+    displacement_event = _extract_displacement_event(ltf_events)
+    in_ote_flag = _price_in_range(price_value, ote_range)
+    session_ok = in_killzone_now()
+
     bullish_event: Optional[Dict[str, Any]] = None
-    bullish_key = None
+    bullish_key: Optional[str] = None
     if isinstance(htf_events, dict):
         for candidate in ("BOS", "CHOCH"):
             event = htf_events.get(candidate)
@@ -9184,56 +9392,156 @@ def detect_ict_strategy(
                 bullish_event = event
                 bullish_key = candidate
                 break
+
+    bearish_event: Optional[Dict[str, Any]] = None
+    bearish_key: Optional[str] = None
+    if isinstance(htf_events, dict):
+        for candidate in ("BOS", "CHOCH"):
+            event = htf_events.get(candidate)
+            if isinstance(event, dict) and event.get("direction") == "bearish":
+                bearish_event = event
+                bearish_key = candidate
+                break
+
     sweep_sell = (
         sweep_event
         if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "sell-side"
         else None
     )
-    zone_match_long: Optional[Dict[str, Any]] = None
-    zone_source_long: Optional[str] = None
-    if effective_ote_range is not None and price_value is not None:
-        if allow_order_block:
-            zone_match_long = _find_zone_match(demand_boxes, effective_ote_range, price_value)
-            if zone_match_long is not None:
-                zone_source_long = "demand_ob"
-        if zone_match_long is None and allow_fvg:
-            alt_match = _find_zone_match(bullish_fvg_boxes, effective_ote_range, price_value)
-            if alt_match is not None:
-                zone_match_long = alt_match
-                zone_source_long = "bullish_fvg"
+    sweep_buy = (
+        sweep_event
+        if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "buy-side"
+        else None
+    )
 
-    sweep_sell_ok = sweep_sell is not None or not require_liquidity_sweep
+    demand_match_long = (
+        _find_zone_match(demand_boxes, price_value, ote_range) if allow_order_block else None
+    )
+    supply_match_short = (
+        _find_zone_match(supply_boxes, price_value, ote_range) if allow_order_block else None
+    )
+    bullish_fvg_match = (
+        _find_zone_match(bullish_fvg_boxes, price_value, ote_range) if allow_fvg else None
+    )
+    bearish_fvg_match = (
+        _find_zone_match(bearish_fvg_boxes, price_value, ote_range) if allow_fvg else None
+    )
 
-    if (
-        bullish_event
-        and sweep_sell_ok
-        and zone_match_long is not None
-        and effective_ote_range is not None
-        and golden_direction >= 0
-        and price_value is not None
-    ):
-        event_key = bullish_key or "BOS"
-        reasons = [f"HTF {htf_tf} {event_key} صاعد مؤكد"]
-        if sweep_sell is not None:
-            reasons.append("LTF 1m سحب سيولة بيعي (sell-side sweep)")
-        reasons.append("السعر داخل منطقة طلب/FVG صاعدة ضمن نطاق OTE")
+    displacement_long = bool(displacement_event) or bool(bullish_fvg_boxes)
+    displacement_short = bool(displacement_event) or bool(bearish_fvg_boxes)
+
+    facts_long: Dict[str, bool] = {
+        "htf_bullish_bias": bullish_event is not None,
+        "liquidity_sweep": sweep_sell is not None,
+        "displacement_or_mss": displacement_long,
+        "fvg_marked": bool(bullish_fvg_boxes),
+        "bullish_fvg": bullish_fvg_match is not None,
+        "demand_ob": demand_match_long is not None,
+        "in_ote": in_ote_flag,
+    }
+
+    facts_short: Dict[str, bool] = {
+        "htf_bearish_bias": bearish_event is not None,
+        "liquidity_sweep": sweep_buy is not None,
+        "displacement_or_mss": displacement_short,
+        "fvg_marked": bool(bearish_fvg_boxes),
+        "bearish_fvg": bearish_fvg_match is not None,
+        "supply_ob": supply_match_short is not None,
+        "in_ote": in_ote_flag,
+    }
+
+    long_decision = should_enter_long(facts_long)
+    short_decision = should_enter_short(facts_short)
+
+    reason_labels = {
+        "bullish_fvg": "مطابقة FVG صاعدة",
+        "bearish_fvg": "مطابقة FVG هابطة",
+        "demand_ob": "منطقة طلب نشطة",
+        "supply_ob": "منطقة عرض نشطة",
+        "in_ote": "السعر داخل نطاق OTE المفضل",
+        "mss_tag": "اندفاع MSS/Displacement مؤكد",
+        "session_ok": "داخل Killzone/Silver Bullet",
+    }
+
+    entry_price = price_value if isinstance(price_value, (int, float)) else float("nan")
+
+    if long_decision.get("decision") and bullish_event:
+        reasons_display = [
+            f"{reason_labels.get(key, key)} (+{weight:.1f})" for key, weight in long_decision.get("reasons", [])
+        ]
+        zone_payload: Optional[Dict[str, Any]] = None
+        if demand_match_long is not None:
+            zone_payload = {"source": "demand_ob", **demand_match_long}
+        elif bullish_fvg_match is not None:
+            zone_payload = {"source": "bullish_fvg", **bullish_fvg_match}
         metadata = {
-            "htf_event": {"key": event_key, **bullish_event},
+            "score": long_decision.get("score"),
+            "reasons_raw": long_decision.get("reasons"),
+            "risk": long_decision.get("risk"),
+            "facts": facts_long,
+            "htf_event": {"key": bullish_key or "BOS", **bullish_event},
             "ltf_sweep": sweep_sell,
-            "zone": {"source": zone_source_long, **zone_match_long},
-            "golden_direction": golden_direction,
+            "zone": zone_payload,
+            "ote_range": ote_range,
+            "displacement": displacement_event,
+            "session_ok": session_ok,
         }
         matches.append(
             ICTStrategyMatch(
                 direction="long",
-                setup="Bullish BOS + sell-side sweep + OTE confluence",
-                ote_range=ote_range or effective_ote_range,
-                price=price_value,
+                setup="HTF bullish bias + liquidity sweep + displacement + entry confluence",
+                price=entry_price,
                 timeframe_alignment=(htf_tf, ltf_tf),
-                reasons=reasons,
+                ote_range=ote_range,
+                reasons=reasons_display,
                 metadata=metadata,
             )
         )
+
+    if short_decision.get("decision") and bearish_event:
+        reasons_display = [
+            f"{reason_labels.get(key, key)} (+{weight:.1f})" for key, weight in short_decision.get("reasons", [])
+        ]
+        zone_payload = None
+        if supply_match_short is not None:
+            zone_payload = {"source": "supply_ob", **supply_match_short}
+        elif bearish_fvg_match is not None:
+            zone_payload = {"source": "bearish_fvg", **bearish_fvg_match}
+        metadata = {
+            "score": short_decision.get("score"),
+            "reasons_raw": short_decision.get("reasons"),
+            "risk": short_decision.get("risk"),
+            "facts": facts_short,
+            "htf_event": {"key": bearish_key or "BOS", **bearish_event},
+            "ltf_sweep": sweep_buy,
+            "zone": zone_payload,
+            "ote_range": ote_range,
+            "displacement": displacement_event,
+            "session_ok": session_ok,
+        }
+        matches.append(
+            ICTStrategyMatch(
+                direction="short",
+                setup="HTF bearish bias + liquidity sweep + displacement + entry confluence",
+                price=entry_price,
+                timeframe_alignment=(htf_tf, ltf_tf),
+                ote_range=ote_range,
+                reasons=reasons_display,
+                metadata=metadata,
+            )
+        )
+
+    def _format_ote_detail(range_value: Optional[Tuple[float, float]]) -> str:
+        if isinstance(range_value, tuple) and len(range_value) == 2:
+            return f"{format_price(range_value[0])} → {format_price(range_value[1])}"
+        if isinstance(range_value, list) and len(range_value) == 2:
+            return f"{format_price(range_value[0])} → {format_price(range_value[1])}"
+        return "لم يتم حساب نطاق OTE بعد"
+
+    long_displacement_detail = _describe_displacement_event(
+        displacement_event,
+        "وجود FVG صاعدة حديثة يشير إلى اندفاع سعري" if bullish_fvg_boxes else None,
+    )
 
     def _long_structure_status() -> Tuple[bool, str]:
         return bool(bullish_event), _describe_structure_event(bullish_event, "صاعد")
@@ -9243,37 +9551,52 @@ def detect_ict_strategy(
             return True, "الشرط معطل في الإعدادات"
         return sweep_sell is not None, _describe_sweep_event(sweep_sell, "sell-side")
 
-    def _long_ote_status() -> Tuple[bool, str]:
-        if effective_ote_range is not None:
-            return True, f"{format_price(effective_ote_range[0])} → {format_price(effective_ote_range[1])}"
-        detail = "لم يتم تحديد Golden Zone" if require_ote else "لم يتم حساب نطاق OTE بعد"
-        return False, detail
+    def _long_displacement_status() -> Tuple[bool, str]:
+        return displacement_long, long_displacement_detail
 
-    def _long_zone_status() -> Tuple[bool, str]:
-        if not allow_order_block and not allow_fvg:
-            return False, "تم تعطيل مصادر المناطق (OB/FVG)"
-        return zone_match_long is not None, _describe_zone_match(zone_match_long, zone_source_long)
-
-    def _long_golden_status() -> Tuple[bool, str]:
-        if golden_direction >= 0:
-            return True, "الاتجاه الذهبي يشير لصعود أو حياد"
-        return False, "الاتجاه الذهبي يشير لضغط هابط"
-
-    def _long_price_status() -> Tuple[bool, str]:
-        if price_value is not None:
-            return True, f"السعر الحالي {format_price(price_value)}"
-        return False, "لم يتوفر سعر إغلاق حديث"
+    def _long_entry_status() -> Tuple[bool, str]:
+        if facts_long["demand_ob"] or facts_long["bullish_fvg"] or facts_long["in_ote"]:
+            details: List[str] = []
+            if facts_long["demand_ob"]:
+                details.append(_describe_zone_match(demand_match_long, "demand_ob"))
+            if facts_long["bullish_fvg"]:
+                details.append(_describe_zone_match(bullish_fvg_match, "bullish_fvg"))
+            if facts_long["in_ote"]:
+                details.append(f"السعر داخل نطاق OTE المفضل ({_format_ote_detail(ote_range)})")
+            return True, " | ".join(details)
+        suffix = " (مطلوب)" if require_ote else ""
+        return False, f"بانتظار مطابقة FVG أو OB أو دخول نطاق OTE{suffix}"
 
     long_steps: List[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
         (f"حدث هيكلي صاعد على {htf_tf}", _long_structure_status),
         ("سحب سيولة بيعي (sell-side)", _long_sweep_status),
-        ("نطاق OTE متاح", _long_ote_status),
-        ("تطابق منطقة طلب/FVG", _long_zone_status),
-        ("الاتجاه الذهبي يدعم الصعود", _long_golden_status),
-        ("سعر التنفيذ متوفر", _long_price_status),
+        ("اندفاع/MSS مؤكد", _long_displacement_status),
+        ("منطقة دخول صالحة (FVG/OB أو OTE)", _long_entry_status),
     ]
 
     long_conditions, pending_long_labels, long_summary = _evaluate_condition_sequence(long_steps)
+    optional_long = [
+        ICTConditionStatus(
+            name="خيار إضافي: FVG محددة على LTF",
+            met=bool(bullish_fvg_boxes),
+            detail=(
+                f"تم العثور على {len(bullish_fvg_boxes)} فجوة قيمة عادلة صاعدة"
+                if bullish_fvg_boxes
+                else "لا توجد فجوات قيمة عادلة صاعدة حاليًا"
+            ),
+        ),
+        ICTConditionStatus(
+            name="خيار إضافي: نطاق OTE المفضل",
+            met=in_ote_flag,
+            detail=_format_ote_detail(ote_range),
+        ),
+        ICTConditionStatus(
+            name="خيار إضافي: Killzone/Silver Bullet",
+            met=session_ok,
+            detail="داخل نافذة الجلسة" if session_ok else "خارج نوافذ الجلسات المفعّلة",
+        ),
+    ]
+    long_conditions.extend(optional_long)
     pending_long_clean = [_strip_condition_prefix(name) for name in pending_long_labels]
     evaluations.append(
         ICTConditionEvaluation(
@@ -9282,69 +9605,14 @@ def detect_ict_strategy(
             all_met=len(pending_long_labels) == 0,
             summary=long_summary,
             pending_conditions=pending_long_clean,
-            ote_range=effective_ote_range,
+            ote_range=ote_range,
         )
     )
 
-    # Short setup -----------------------------------------------------------
-    bearish_event: Optional[Dict[str, Any]] = None
-    bearish_key = None
-    for candidate in ("BOS", "CHOCH"):
-        event = htf_events.get(candidate) if isinstance(htf_events, dict) else None
-        if isinstance(event, dict) and event.get("direction") == "bearish":
-            bearish_event = event
-            bearish_key = candidate
-            break
-
-    sweep_buy = (
-        sweep_event
-        if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "buy-side"
-        else None
+    short_displacement_detail = _describe_displacement_event(
+        displacement_event,
+        "وجود FVG هابطة حديثة يشير إلى اندفاع سعري" if bearish_fvg_boxes else None,
     )
-    zone_match_short: Optional[Dict[str, Any]] = None
-    zone_source_short: Optional[str] = None
-    if effective_ote_range is not None and price_value is not None:
-        if allow_order_block:
-            zone_match_short = _find_zone_match(supply_boxes, effective_ote_range, price_value)
-            if zone_match_short is not None:
-                zone_source_short = "supply_ob"
-        if zone_match_short is None and allow_fvg:
-            alt_match = _find_zone_match(bearish_fvg_boxes, effective_ote_range, price_value)
-            if alt_match is not None:
-                zone_match_short = alt_match
-                zone_source_short = "bearish_fvg"
-
-    sweep_buy_ok = sweep_buy is not None or not require_liquidity_sweep
-
-    if (
-        bearish_event
-        and sweep_buy_ok
-        and zone_match_short is not None
-        and effective_ote_range is not None
-        and golden_direction <= 0
-        and price_value is not None
-    ):
-        reasons = [f"HTF {htf_tf} {bearish_key} هابط مؤكد"]
-        if sweep_buy is not None:
-            reasons.append("LTF 1m سحب سيولة شرائي (buy-side sweep)")
-        reasons.append("السعر داخل منطقة عرض/FVG هابطة ضمن نطاق OTE")
-        metadata = {
-            "htf_event": {"key": bearish_key, **bearish_event},
-            "ltf_sweep": sweep_buy,
-            "zone": {"source": zone_source_short, **zone_match_short},
-            "golden_direction": golden_direction,
-        }
-        matches.append(
-            ICTStrategyMatch(
-                direction="short",
-                setup="Bearish BOS/CHOCH + buy-side sweep + OTE confluence",
-                ote_range=ote_range or effective_ote_range,
-                price=price_value,
-                timeframe_alignment=(htf_tf, ltf_tf),
-                reasons=reasons,
-                metadata=metadata,
-            )
-        )
 
     def _short_structure_status() -> Tuple[bool, str]:
         return bool(bearish_event), _describe_structure_event(bearish_event, "هابط")
@@ -9354,37 +9622,52 @@ def detect_ict_strategy(
             return True, "الشرط معطل في الإعدادات"
         return sweep_buy is not None, _describe_sweep_event(sweep_buy, "buy-side")
 
-    def _short_ote_status() -> Tuple[bool, str]:
-        if effective_ote_range is not None:
-            return True, f"{format_price(effective_ote_range[0])} → {format_price(effective_ote_range[1])}"
-        detail = "لم يتم تحديد Golden Zone" if require_ote else "لم يتم حساب نطاق OTE بعد"
-        return False, detail
+    def _short_displacement_status() -> Tuple[bool, str]:
+        return displacement_short, short_displacement_detail
 
-    def _short_zone_status() -> Tuple[bool, str]:
-        if not allow_order_block and not allow_fvg:
-            return False, "تم تعطيل مصادر المناطق (OB/FVG)"
-        return zone_match_short is not None, _describe_zone_match(zone_match_short, zone_source_short)
-
-    def _short_golden_status() -> Tuple[bool, str]:
-        if golden_direction <= 0:
-            return True, "الاتجاه الذهبي يشير لهبوط أو حياد"
-        return False, "الاتجاه الذهبي يشير لضغط صاعد"
-
-    def _short_price_status() -> Tuple[bool, str]:
-        if price_value is not None:
-            return True, f"السعر الحالي {format_price(price_value)}"
-        return False, "لم يتوفر سعر إغلاق حديث"
+    def _short_entry_status() -> Tuple[bool, str]:
+        if facts_short["supply_ob"] or facts_short["bearish_fvg"] or facts_short["in_ote"]:
+            details: List[str] = []
+            if facts_short["supply_ob"]:
+                details.append(_describe_zone_match(supply_match_short, "supply_ob"))
+            if facts_short["bearish_fvg"]:
+                details.append(_describe_zone_match(bearish_fvg_match, "bearish_fvg"))
+            if facts_short["in_ote"]:
+                details.append(f"السعر داخل نطاق OTE المفضل ({_format_ote_detail(ote_range)})")
+            return True, " | ".join(details)
+        suffix = " (مطلوب)" if require_ote else ""
+        return False, f"بانتظار مطابقة FVG أو OB أو دخول نطاق OTE{suffix}"
 
     short_steps: List[Tuple[str, Callable[[], Tuple[bool, str]]]] = [
         (f"حدث هيكلي هابط على {htf_tf}", _short_structure_status),
         ("سحب سيولة شرائي (buy-side)", _short_sweep_status),
-        ("نطاق OTE متاح", _short_ote_status),
-        ("تطابق منطقة عرض/FVG", _short_zone_status),
-        ("الاتجاه الذهبي يدعم الهبوط", _short_golden_status),
-        ("سعر التنفيذ متوفر", _short_price_status),
+        ("اندفاع/MSS مؤكد", _short_displacement_status),
+        ("منطقة دخول صالحة (FVG/OB أو OTE)", _short_entry_status),
     ]
 
     short_conditions, pending_short_labels, short_summary = _evaluate_condition_sequence(short_steps)
+    optional_short = [
+        ICTConditionStatus(
+            name="خيار إضافي: FVG محددة على LTF",
+            met=bool(bearish_fvg_boxes),
+            detail=(
+                f"تم العثور على {len(bearish_fvg_boxes)} فجوة قيمة عادلة هابطة"
+                if bearish_fvg_boxes
+                else "لا توجد فجوات قيمة عادلة هابطة حاليًا"
+            ),
+        ),
+        ICTConditionStatus(
+            name="خيار إضافي: نطاق OTE المفضل",
+            met=in_ote_flag,
+            detail=_format_ote_detail(ote_range),
+        ),
+        ICTConditionStatus(
+            name="خيار إضافي: Killzone/Silver Bullet",
+            met=session_ok,
+            detail="داخل نافذة الجلسة" if session_ok else "خارج نوافذ الجلسات المفعّلة",
+        ),
+    ]
+    short_conditions.extend(optional_short)
     pending_short_clean = [_strip_condition_prefix(name) for name in pending_short_labels]
     evaluations.append(
         ICTConditionEvaluation(
@@ -9393,7 +9676,7 @@ def detect_ict_strategy(
             all_met=len(pending_short_labels) == 0,
             summary=short_summary,
             pending_conditions=pending_short_clean,
-            ote_range=effective_ote_range,
+            ote_range=ote_range,
         )
     )
 
