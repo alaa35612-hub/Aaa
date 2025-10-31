@@ -11326,6 +11326,19 @@ def _parse_args_android():
     p.add_argument("--no-ote", action="store_true")
     p.add_argument("--no-ote-alert", action="store_true")
     p.add_argument("--bos-confirmation", choices=["Close","Wick","Candle High"], default="Close")
+    p.add_argument("--workers", type=int, default=6, help="عدد المهام المتوازية لجلب البيانات")
+    p.add_argument(
+        "--stream-poll",
+        type=float,
+        default=1.0,
+        help="الفاصل بالثواني بين تحديثات البث المباشر",
+    )
+    p.add_argument(
+        "--stream-duration",
+        type=float,
+        default=0.0,
+        help="المدة الكلية بالثواني للبث (0 يعني تشغيل مستمر)",
+    )
     args = p.parse_args()
 
     if args.limit <= 0:
@@ -11334,6 +11347,10 @@ def _parse_args_android():
         p.error("--max-symbols must be > 0")
     if args.recent <= 0:
         p.error("--recent يجب أن يكون رقمًا موجبًا")
+    if args.workers <= 0:
+        p.error("--workers يجب أن يكون رقمًا موجبًا")
+    if args.stream_poll < 0:
+        p.error("--stream-poll لا يمكن أن يكون سالبًا")
 
     zone_type = args.zone_type
     if args.use_mother_bar:
@@ -11408,8 +11425,7 @@ def _android_cli_entry() -> int:
     recent_window = max(1, args.recent)
 
     symbols = _pick_symbols(cfg, symbol_override=(args.symbol or None), max_symbols_hint=args.max_symbols)
-    symbols = list(dict.fromkeys(symbols))
-    ex = _build_exchange('usdtm')
+    symbols = list(dict.fromkeys(symbols))[: int(cfg.max_scan)]
 
     try:
         SmartMoneyAlgoProE5
@@ -11438,76 +11454,41 @@ def _android_cli_entry() -> int:
     ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
 
     inputs = IndicatorInputs(
-        pullback=pullback, structure=structure, order_flow=order_flow,
-        fvg=fvg, liquidity=liq, demand_supply=ds, order_block=ob,
-        structure_util=utils, ict_structure=ict,
+        pullback=pullback,
+        structure=structure,
+        order_flow=order_flow,
+        fvg=fvg,
+        liquidity=liq,
+        demand_supply=ds,
+        order_block=ob,
+        structure_util=utils,
+        ict_structure=ict,
     )
     inputs.console.max_age_bars = max(1, recent_window - 1)
+    inputs.scanner_runtime.mode = "stream"
+    inputs.scanner_runtime.parallel_tasks = max(1, min(args.workers, max(1, len(symbols))))
+    inputs.scanner_runtime.poll_interval_seconds = max(0.1, float(args.stream_poll))
+    if args.stream_duration > 0:
+        inputs.scanner_runtime.stream_duration_seconds = float(args.stream_duration)
+    else:
+        inputs.scanner_runtime.stream_duration_seconds = None
+    inputs.scanner_runtime.max_cycles = None
+    inputs.scanner_runtime.incremental_limit = max(10, int(args.limit))
 
-    alerts_total = 0
-    alert_cfg = getattr(inputs, "immediate_alerts", None)
-    event_cache = _build_immediate_event_cache(alert_cfg)
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process([{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')} for c in candles])
-        except Exception as e:
-            print(
-                f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                file=sys.stderr,
-            )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        immediate_events = _collect_immediate_events(
-            sym,
+    try:
+        scan_binance(
             args.timeframe,
-            latest_events,
-            runtime,
-            event_cache,
-            alert_cfg,
+            args.limit,
+            symbols,
+            inputs.scanner_runtime.parallel_tasks,
+            tracer=None,
+            min_daily_change=0.0,
+            inputs=inputs,
+            recent_window_bars=recent_window,
         )
-        if immediate_events:
-            metrics.setdefault("immediate_event_alerts", []).extend(immediate_events)
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=recent_window
-        )
-        if not recent_hits and not immediate_events:
-            if recent_window == 1:
-                span_phrase = "آخر شمعة واحدة"
-            elif recent_window == 2:
-                span_phrase = "آخر شمعتين"
-            else:
-                span_phrase = f"آخر {recent_window} شموع"
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-            )
-            continue
-
-        recent_alerts = list(getattr(runtime, "alerts", []))
-        if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
-            try:
-                cutoff_idx = max(0, runtime.series.length() - recent_window)
-                cutoff_time = runtime.series.get_time(cutoff_idx)
-                if cutoff_time:
-                    recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-            except Exception:
-                pass
-
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            alerts_total += len(recent_alerts)
-
-    if args.verbose:
-        print(f"\\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
-    if event_cache is not None:
-        event_cache.save()
+    except KeyboardInterrupt:
+        print("\nتم إيقاف البث المباشر يدويًا.")
+        return 0
     return 0
 
 # ---------- Router ----------
