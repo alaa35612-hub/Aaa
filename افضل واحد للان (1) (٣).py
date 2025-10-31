@@ -97,11 +97,40 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+@dataclass
+class ICTStrategySettings:
+    enabled: bool = True
+    higher_timeframe: str = "15m"
+    lower_timeframe: str = "1m"
+    higher_lookback: int = 400
+    lower_lookback: int = 1200
+    ote_ratio: Tuple[float, float] = (0.62, 0.79)
+    require_liquidity_sweep: bool = True
+    require_ote: bool = True
+    allow_order_block: bool = True
+    allow_fvg: bool = True
+
+
+@dataclass
+class ICTScannerSettings:
+    enabled: bool = True
+    timeframe: str = "1h"
+    lookback_candles: int = 0
+    concurrency: int = 3
+    min_daily_change: float = 0.0
+    recent_window_bars: int = 1
+    max_symbols: int = 60
+
+
+ICT_STRATEGY_SETTINGS = ICTStrategySettings()
+ICT_SCANNER_SETTINGS = ICTScannerSettings()
+
+
 ICT_STRATEGY_RULES: Dict[str, Any] = {
     "strategy": {
         "name": "ICT Multi-Timeframe Sweep OTE",
-        "higher_timeframe": "15m",
-        "lower_timeframe": "1m",
+        "higher_timeframe": ICT_STRATEGY_SETTINGS.higher_timeframe,
+        "lower_timeframe": ICT_STRATEGY_SETTINGS.lower_timeframe,
         "entry_rules": {
             "long_setup": {
                 "htf_trend": "Bullish BOS on 15m (uptrend structure confirmed)",
@@ -125,11 +154,15 @@ ICT_STRATEGY_RULES: Dict[str, Any] = {
     },
     "focus_sessions": ["London", "New York", "Asia"],
     "runtime": {
-        "htf_timeframe": "15m",
-        "ltf_timeframe": "1m",
-        "htf_lookback": 400,
-        "ltf_lookback": 1200,
-        "ote_ratio": (0.62, 0.79),
+        "htf_timeframe": ICT_STRATEGY_SETTINGS.higher_timeframe,
+        "ltf_timeframe": ICT_STRATEGY_SETTINGS.lower_timeframe,
+        "htf_lookback": ICT_STRATEGY_SETTINGS.higher_lookback,
+        "ltf_lookback": ICT_STRATEGY_SETTINGS.lower_lookback,
+        "ote_ratio": ICT_STRATEGY_SETTINGS.ote_ratio,
+        "require_liquidity_sweep": ICT_STRATEGY_SETTINGS.require_liquidity_sweep,
+        "require_ote": ICT_STRATEGY_SETTINGS.require_ote,
+        "allow_order_block": ICT_STRATEGY_SETTINGS.allow_order_block,
+        "allow_fvg": ICT_STRATEGY_SETTINGS.allow_fvg,
     },
 }
 
@@ -8717,11 +8750,19 @@ def detect_ict_strategy(
     config: Dict[str, Any] = ICT_STRATEGY_RULES,
 ) -> List[ICTStrategyMatch]:
     matches: List[ICTStrategyMatch] = []
-    runtime_cfg = config.get("runtime", {})
-    htf_tf = runtime_cfg.get("htf_timeframe", "15m")
-    ltf_tf = runtime_cfg.get("ltf_timeframe", "1m")
-    htf_limit = int(runtime_cfg.get("htf_lookback", 400) or 400)
-    ltf_limit = int(runtime_cfg.get("ltf_lookback", 1200) or 1200)
+    if not ICT_STRATEGY_SETTINGS.enabled:
+        return matches
+    runtime_cfg = config.get("runtime", {}) if isinstance(config, dict) else {}
+    htf_tf = runtime_cfg.get("htf_timeframe", ICT_STRATEGY_SETTINGS.higher_timeframe)
+    ltf_tf = runtime_cfg.get("ltf_timeframe", ICT_STRATEGY_SETTINGS.lower_timeframe)
+    htf_limit = int(runtime_cfg.get("htf_lookback", ICT_STRATEGY_SETTINGS.higher_lookback) or ICT_STRATEGY_SETTINGS.higher_lookback)
+    ltf_limit = int(runtime_cfg.get("ltf_lookback", ICT_STRATEGY_SETTINGS.lower_lookback) or ICT_STRATEGY_SETTINGS.lower_lookback)
+    require_liquidity_sweep = bool(
+        runtime_cfg.get("require_liquidity_sweep", ICT_STRATEGY_SETTINGS.require_liquidity_sweep)
+    )
+    require_ote = bool(runtime_cfg.get("require_ote", ICT_STRATEGY_SETTINGS.require_ote))
+    allow_order_block = bool(runtime_cfg.get("allow_order_block", ICT_STRATEGY_SETTINGS.allow_order_block))
+    allow_fvg = bool(runtime_cfg.get("allow_fvg", ICT_STRATEGY_SETTINGS.allow_fvg))
 
     try:
         htf_candles = fetch_ohlcv(exchange, symbol, htf_tf, htf_limit)
@@ -8778,6 +8819,13 @@ def detect_ict_strategy(
             if isinstance(price_payload, (list, tuple)) and len(price_payload) == 2:
                 ote_range = _normalise_price_range(price_payload[0], price_payload[1])
 
+    if require_ote and ote_range is None:
+        return matches
+
+    effective_ote_range = ote_range
+    if effective_ote_range is None and not require_ote and price_value is not None:
+        effective_ote_range = (price_value, price_value)
+
     sweep_event = ltf_events.get("X") if isinstance(ltf_events, dict) else None
 
     demand_boxes = _collect_box_array(runtime_ltf, "demandZone", "demandZoneIsMit")
@@ -8793,27 +8841,33 @@ def detect_ict_strategy(
         if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "sell-side"
         else None
     )
-    zone_match_long = _find_zone_match(demand_boxes, ote_range, price_value)
-    zone_source_long = "demand_ob" if zone_match_long else None
-    if zone_match_long is None:
-        alt_match = _find_zone_match(bullish_fvg_boxes, ote_range, price_value)
-        if alt_match is not None:
-            zone_match_long = alt_match
-            zone_source_long = "bullish_fvg"
+    zone_match_long: Optional[Dict[str, Any]] = None
+    zone_source_long: Optional[str] = None
+    if effective_ote_range is not None and price_value is not None:
+        if allow_order_block:
+            zone_match_long = _find_zone_match(demand_boxes, effective_ote_range, price_value)
+            if zone_match_long is not None:
+                zone_source_long = "demand_ob"
+        if zone_match_long is None and allow_fvg:
+            alt_match = _find_zone_match(bullish_fvg_boxes, effective_ote_range, price_value)
+            if alt_match is not None:
+                zone_match_long = alt_match
+                zone_source_long = "bullish_fvg"
+
+    sweep_sell_ok = sweep_sell is not None or not require_liquidity_sweep
 
     if (
         bullish_htf
-        and sweep_sell
+        and sweep_sell_ok
         and zone_match_long is not None
-        and ote_range is not None
+        and effective_ote_range is not None
         and golden_direction >= 0
         and price_value is not None
     ):
-        reasons = [
-            f"HTF {htf_tf} BOS صاعد مؤكد",
-            "LTF 1m سحب سيولة بيعي (sell-side sweep)",
-            "السعر داخل منطقة طلب/FVG صاعدة ضمن نطاق OTE",
-        ]
+        reasons = [f"HTF {htf_tf} BOS صاعد مؤكد"]
+        if sweep_sell is not None:
+            reasons.append("LTF 1m سحب سيولة بيعي (sell-side sweep)")
+        reasons.append("السعر داخل منطقة طلب/FVG صاعدة ضمن نطاق OTE")
         metadata = {
             "htf_event": {"key": "BOS", **bullish_htf},
             "ltf_sweep": sweep_sell,
@@ -8824,7 +8878,7 @@ def detect_ict_strategy(
             ICTStrategyMatch(
                 direction="long",
                 setup="Bullish BOS + sell-side sweep + OTE confluence",
-                ote_range=ote_range,
+                ote_range=ote_range or effective_ote_range,
                 price=price_value,
                 timeframe_alignment=(htf_tf, ltf_tf),
                 reasons=reasons,
@@ -8847,27 +8901,33 @@ def detect_ict_strategy(
         if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "buy-side"
         else None
     )
-    zone_match_short = _find_zone_match(supply_boxes, ote_range, price_value)
-    zone_source_short = "supply_ob" if zone_match_short else None
-    if zone_match_short is None:
-        alt_match = _find_zone_match(bearish_fvg_boxes, ote_range, price_value)
-        if alt_match is not None:
-            zone_match_short = alt_match
-            zone_source_short = "bearish_fvg"
+    zone_match_short: Optional[Dict[str, Any]] = None
+    zone_source_short: Optional[str] = None
+    if effective_ote_range is not None and price_value is not None:
+        if allow_order_block:
+            zone_match_short = _find_zone_match(supply_boxes, effective_ote_range, price_value)
+            if zone_match_short is not None:
+                zone_source_short = "supply_ob"
+        if zone_match_short is None and allow_fvg:
+            alt_match = _find_zone_match(bearish_fvg_boxes, effective_ote_range, price_value)
+            if alt_match is not None:
+                zone_match_short = alt_match
+                zone_source_short = "bearish_fvg"
+
+    sweep_buy_ok = sweep_buy is not None or not require_liquidity_sweep
 
     if (
         bearish_event
-        and sweep_buy
+        and sweep_buy_ok
         and zone_match_short is not None
-        and ote_range is not None
+        and effective_ote_range is not None
         and golden_direction <= 0
         and price_value is not None
     ):
-        reasons = [
-            f"HTF {htf_tf} {bearish_key} هابط مؤكد",
-            "LTF 1m سحب سيولة شرائي (buy-side sweep)",
-            "السعر داخل منطقة عرض/FVG هابطة ضمن نطاق OTE",
-        ]
+        reasons = [f"HTF {htf_tf} {bearish_key} هابط مؤكد"]
+        if sweep_buy is not None:
+            reasons.append("LTF 1m سحب سيولة شرائي (buy-side sweep)")
+        reasons.append("السعر داخل منطقة عرض/FVG هابطة ضمن نطاق OTE")
         metadata = {
             "htf_event": {"key": bearish_key, **bearish_event},
             "ltf_sweep": sweep_buy,
@@ -8878,7 +8938,7 @@ def detect_ict_strategy(
             ICTStrategyMatch(
                 direction="short",
                 setup="Bearish BOS/CHOCH + buy-side sweep + OTE confluence",
-                ote_range=ote_range,
+                ote_range=ote_range or effective_ote_range,
                 price=price_value,
                 timeframe_alignment=(htf_tf, ltf_tf),
                 reasons=reasons,
@@ -8909,10 +8969,20 @@ def scan_binance(
         inputs = IndicatorInputs()
     else:
         inputs = copy.deepcopy(inputs)
+
+    if not ICT_SCANNER_SETTINGS.enabled:
+        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+        runtime.process([])
+        print("تم تعطيل ماسح استراتيجية ICT من خلال الإعدادات.", flush=True)
+        return runtime, []
+
     inputs.fvg.show_fvg = True
     inputs.structure_util.isOTE = True
     inputs.structure_util.markX = True
     inputs.structure_util.showSw = True
+    if max_symbols is None:
+        max_symbols = ICT_SCANNER_SETTINGS.max_symbols
+
     all_symbols = symbols or fetch_binance_usdtm_symbols(
         exchange,
         limit=max_symbols,
@@ -9016,21 +9086,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
     parser.add_argument("--outfile", type=Path, default=Path("FINAL_REPORT_SMART_MONEY_ANALYSIS.md"))
-    parser.add_argument("--timeframe", type=str, default="1h", help="Timeframe used when scanning Binance")
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        default=ICT_SCANNER_SETTINGS.timeframe,
+        help="Timeframe used when scanning Binance",
+    )
     parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data or --no-scan")
     parser.add_argument(
         "--lookback",
         type=int,
-        default=0,
+        default=ICT_SCANNER_SETTINGS.lookback_candles,
         help="Number of candles to request per symbol when scanning (0 = full history)",
     )
     parser.add_argument("--bars", type=int, default=0, help="Limit number of candles to analyse from --data source")
     parser.add_argument("--symbols", type=str, default="")
-    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--concurrency", type=int, default=ICT_SCANNER_SETTINGS.concurrency)
     parser.add_argument(
         "--min-daily-change",
         type=float,
-        default=0.0,
+        default=ICT_SCANNER_SETTINGS.min_daily_change,
         help="الحد الأدنى لتغير 24 ساعة (٪) لاختيار الرمز عند مسح Binance، 0 لتعطيل الفلتر",
     )
     parser.add_argument(
@@ -9051,7 +9126,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--max-age-bars",
         type=int,
-        default=1,
+        default=max(1, ICT_SCANNER_SETTINGS.recent_window_bars),
         help="Ignore console events older than this many completed bars (minimum 1)",
     )
     args = parser.parse_args(argv)
@@ -9144,6 +9219,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tracer,
         min_daily_change=args.min_daily_change,
         inputs=indicator_inputs,
+        recent_window_bars=args.max_age_bars,
+        max_symbols=ICT_SCANNER_SETTINGS.max_symbols,
     )
     perform_comparison()
     log("Rendering")
