@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import bisect
+import contextlib
 import copy
 import dataclasses
 import datetime
@@ -9212,10 +9213,27 @@ def _extract_golden_zone(runtime: Any) -> Tuple[Optional[Tuple[float, float]], i
 
 
 class BinanceUSDMAsyncSession:
+    _RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
+
     def __init__(self, exchange: Any, concurrency: int) -> None:
         self.exchange = exchange
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
         self._markets_lock = asyncio.Lock()
+
+    async def _retry_operation(self, op: Callable[[], Awaitable[Any]]) -> Any:
+        last_exc: Optional[BaseException] = None
+        for attempt, delay in enumerate(self._RETRY_DELAYS):
+            try:
+                async with self._semaphore:
+                    return await op()
+            except Exception as exc:
+                last_exc = exc
+                if attempt == len(self._RETRY_DELAYS) - 1:
+                    raise
+                await asyncio.sleep(delay)
+        if last_exc:
+            raise last_exc
+        return None
 
     @classmethod
     async def create(
@@ -9232,7 +9250,34 @@ class BinanceUSDMAsyncSession:
         else:
             if ccxt_async is None:
                 raise RuntimeError("ccxt.async_support is not available")
-            exchange = ccxt_async.binanceusdm({"enableRateLimit": True})
+            exchange = ccxt_async.binanceusdm(
+                {
+                    "enableRateLimit": True,
+                    "timeout": 20_000,
+                    "options": {
+                        "defaultType": "future",
+                        "adjustForTimeDifference": True,
+                    },
+                }
+            )
+
+        try:
+            delays = list(cls._RETRY_DELAYS)
+            for attempt in range(len(delays) + 1):
+                try:
+                    await exchange.load_markets(reload=True)
+                    break
+                except Exception:
+                    if attempt >= len(delays):
+                        raise
+                    await asyncio.sleep(delays[attempt])
+        except Exception:
+            closer = getattr(exchange, "close", None)
+            if callable(closer):
+                with contextlib.suppress(Exception):
+                    await closer()
+            raise
+
         return cls(exchange, concurrency)
 
     async def close(self) -> None:
@@ -9244,22 +9289,23 @@ class BinanceUSDMAsyncSession:
                 pass
 
     async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
-        async with self._semaphore:
-            return await self.exchange.fetch_ticker(symbol)
+        return await self._retry_operation(lambda: self.exchange.fetch_ticker(symbol))
 
     async def fetch_tickers(
         self, symbols: Optional[Sequence[str]] = None
     ) -> Dict[str, Dict[str, Any]]:
-        async with self._semaphore:
+        async def _call() -> Dict[str, Dict[str, Any]]:
             try:
                 return await self.exchange.fetch_tickers(list(symbols) if symbols else None)
             except TypeError:
-                # Some ccxt exchanges don't accept symbol lists; retry without filter.
                 return await self.exchange.fetch_tickers()
 
+        return await self._retry_operation(_call)
+
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
-        async with self._semaphore:
-            return await fetch_ohlcv_async(self.exchange, symbol, timeframe, limit)
+        return await self._retry_operation(
+            lambda: fetch_ohlcv_async(self.exchange, symbol, timeframe, limit)
+        )
 
     async def fetch_symbols(
         self,
@@ -9556,8 +9602,9 @@ async def scan_binance_async(
     runtime_inputs.structure_util.markX = True
     runtime_inputs.structure_util.showSw = True
 
+    effective_concurrency = max(1, min(concurrency, 4))
     session = await BinanceUSDMAsyncSession.create(
-        max(1, concurrency), exchange_factory=exchange_factory
+        effective_concurrency, exchange_factory=exchange_factory
     )
     try:
         if symbols:
@@ -9613,119 +9660,130 @@ async def scan_binance_async(
         await dispatcher.start()
 
         runtime_cache: Dict[str, SymbolRuntimeContext] = {}
+        worker_gate = asyncio.Semaphore(effective_concurrency)
 
         async def process_symbol(
             idx: int, symbol: str
         ) -> Tuple[int, Optional[Dict[str, Any]], Optional[SmartMoneyAlgoProE5]]:
-            ticker = ticker_cache.get(symbol) or {}
-            daily_change = _extract_daily_change_percent(ticker)
-            if (
-                min_daily_change > 0.0
-                and daily_change is not None
-                and daily_change <= min_daily_change
-            ):
-                async with print_lock:
-                    print(
-                        f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                        flush=True,
-                    )
-                if tracer and tracer.enabled:
-                    async with tracer_lock:
-                        tracer.log(
-                            "scan",
-                            "symbol_skipped_daily_change",
-                            timestamp=None,
-                            symbol=symbol,
-                            change=daily_change,
-                            threshold=min_daily_change,
+            async with worker_gate:
+                ticker = ticker_cache.get(symbol) or {}
+                daily_change = _extract_daily_change_percent(ticker)
+                if (
+                    min_daily_change > 0.0
+                    and daily_change is not None
+                    and daily_change <= min_daily_change
+                ):
+                    async with print_lock:
+                        print(
+                            f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                            flush=True,
                         )
-                return idx, None, None
+                    if tracer and tracer.enabled:
+                        async with tracer_lock:
+                            tracer.log(
+                                "scan",
+                                "symbol_skipped_daily_change",
+                                timestamp=None,
+                                symbol=symbol,
+                                change=daily_change,
+                                threshold=min_daily_change,
+                            )
+                    return idx, None, None
 
-            try:
-                candles = await session.fetch_ohlcv(symbol, timeframe, limit)
-                if drop_last_incomplete and candles:
-                    candles = candles[:-1]
-            except Exception as exc:
-                async with print_lock:
-                    print(
-                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ohlcv: {exc}",
-                        file=sys.stderr,
-                        flush=True,
+                try:
+                    candles = await session.fetch_ohlcv(symbol, timeframe, limit)
+                    if drop_last_incomplete and candles:
+                        candles = candles[:-1]
+                except Exception as exc:
+                    async with print_lock:
+                        print(
+                            f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ohlcv: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    if tracer and tracer.enabled:
+                        async with tracer_lock:
+                            tracer.log(
+                                "scan",
+                                "symbol_failed",
+                                timestamp=None,
+                                symbol=symbol,
+                                error=str(exc),
+                            )
+                    return idx, None, None
+
+                context = runtime_cache.get(symbol)
+                if context is None:
+                    runtime = SmartMoneyAlgoProE5(
+                        inputs=_clone_indicator_inputs(runtime_inputs),
+                        base_timeframe=timeframe,
+                        tracer=tracer,
                     )
-                return idx, None, None
+                    context = SymbolRuntimeContext(runtime)
+                    runtime_cache[symbol] = context
+                processed = context.ingest(candles)
+                runtime = context.runtime
 
-            context = runtime_cache.get(symbol)
-            if context is None:
-                runtime = SmartMoneyAlgoProE5(
-                    inputs=_clone_indicator_inputs(runtime_inputs),
-                    base_timeframe=timeframe,
-                    tracer=tracer,
+                metrics = runtime.gather_console_metrics()
+                latest_events = metrics.get("latest_events") or {}
+                strategy_matches = await detect_ict_strategy_async(
+                    lambda sym, tf, lim: session.fetch_ohlcv(sym, tf, lim),
+                    symbol,
+                    runtime_inputs,
+                    tracer,
                 )
-                context = SymbolRuntimeContext(runtime)
-                runtime_cache[symbol] = context
-            processed = context.ingest(candles)
-            runtime = context.runtime
+                if strategy_matches:
+                    metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
+                recent_hits, recent_times = _collect_recent_event_hits(
+                    runtime.series, latest_events, bars=window
+                )
+                if not recent_hits and not strategy_matches:
+                    async with print_lock:
+                        print(
+                            f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
+                            flush=True,
+                        )
+                    if tracer and tracer.enabled:
+                        async with tracer_lock:
+                            tracer.log(
+                                "scan",
+                                "symbol_skipped_stale_events",
+                                timestamp=runtime.series.get_time(0) or None,
+                                symbol=symbol,
+                                timeframe=timeframe,
+                                reference_times=recent_times,
+                                window=window,
+                            )
+                    return idx, None, None
 
-            metrics = runtime.gather_console_metrics()
-            latest_events = metrics.get("latest_events") or {}
-            strategy_matches = await detect_ict_strategy_async(
-                lambda sym, tf, lim: session.fetch_ohlcv(sym, tf, lim),
-                symbol,
-                runtime_inputs,
-                tracer,
-            )
-            if strategy_matches:
-                metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
-            recent_hits, recent_times = _collect_recent_event_hits(
-                runtime.series, latest_events, bars=window
-            )
-            if not recent_hits and not strategy_matches:
+                metrics["daily_change_percent"] = daily_change
+                summary = {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "candles": len(candles),
+                    "alerts": metrics.get("alerts", len(runtime.alerts)),
+                    "boxes": metrics.get("boxes", len(runtime.boxes)),
+                    "metrics": metrics,
+                }
+
                 async with print_lock:
-                    print(
-                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                        flush=True,
-                    )
+                    print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
                 if tracer and tracer.enabled:
                     async with tracer_lock:
                         tracer.log(
                             "scan",
-                            "symbol_skipped_stale_events",
-                            timestamp=runtime.series.get_time(0) or None,
+                            "symbol_complete",
+                            timestamp=runtime.series.get_time(0),
                             symbol=symbol,
                             timeframe=timeframe,
-                            reference_times=recent_times,
-                            window=window,
+                            candles=len(candles),
                         )
-                return idx, None, None
 
-            metrics["daily_change_percent"] = daily_change
-            summary = {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(runtime.alerts)),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
-                "metrics": metrics,
-            }
+                if processed:
+                    events = _collect_immediate_events(runtime)
+                    await dispatcher.publish(symbol, events)
 
-            async with print_lock:
-                print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-            if tracer and tracer.enabled:
-                async with tracer_lock:
-                    tracer.log(
-                        "scan",
-                        "symbol_complete",
-                        timestamp=runtime.series.get_time(0),
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        candles=len(candles),
-                    )
-
-            if processed:
-                events = _collect_immediate_events(runtime)
-                await dispatcher.publish(symbol, events)
-
-            return idx, summary, runtime
+                return idx, summary, runtime
 
         try:
             tasks = [
@@ -10003,15 +10061,61 @@ def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
         pass
 
 # ----------------------------- Symbol Picker ----------------------------------
+_SYNC_EXCHANGE_CACHE: Dict[str, Any] = {}
+_SYNC_MARKETS_CACHE: Dict[str, Dict[str, Any]] = {}
+_SYNC_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0)
+
+
+def _sync_exchange_key(market: str) -> str:
+    return (market or "usdtm").lower()
+
+
+def _get_sync_exchange_with_markets(market: str) -> Tuple[Any, Dict[str, Any]]:
+    if ccxt is None:
+        raise RuntimeError("ccxt is required for Binance scanning")
+
+    key = _sync_exchange_key(market)
+    exchange = _SYNC_EXCHANGE_CACHE.get(key)
+    if exchange is None:
+        config = {
+            "enableRateLimit": True,
+            "timeout": 20_000,
+            "options": {
+                "defaultType": "future",
+                "adjustForTimeDifference": True,
+            },
+        }
+        exchange = ccxt.binanceusdm(config)
+        _SYNC_EXCHANGE_CACHE[key] = exchange
+
+    if key not in _SYNC_MARKETS_CACHE:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(len(_SYNC_RETRY_DELAYS) + 1):
+            try:
+                markets = exchange.load_markets(reload=True)
+                _SYNC_MARKETS_CACHE[key] = markets
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= len(_SYNC_RETRY_DELAYS):
+                    raise
+                time.sleep(_SYNC_RETRY_DELAYS[attempt])
+        else:
+            if last_exc:
+                raise last_exc
+
+    return exchange, _SYNC_MARKETS_CACHE[key]
+
+
 def _build_exchange(market: str):
     # Futures-only
-    return ccxt.binanceusdm({"enableRateLimit": True})
+    exchange, _ = _get_sync_exchange_with_markets(market)
+    return exchange
 
 def _pick_symbols(cfg: _CLISettings, symbol_override: Optional[str] = None, max_symbols_hint: int = 300) -> List[str]:
     if symbol_override:
         return [symbol_override.strip().upper()]
-    ex = _build_exchange(cfg.market)
-    markets = ex.load_markets()
+    ex, markets = _get_sync_exchange_with_markets(cfg.market)
     if cfg.market == "usdtm":
         universe = [s for s, m in markets.items() if m.get("linear") and m.get("quote") == "USDT" and m.get("type") == "swap"]
     else:
@@ -10864,11 +10968,12 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             print(f"- {name}: {ts_s} UTC  |  {colored_title}")
 
 # ---------- Live exchange helpers (Futures-only) ----------
-def _build_exchange(_market_forced_usdtm:str="usdtm"):
-    return ccxt.binanceusdm({"enableRateLimit": True})
+def _build_exchange(_market_forced_usdtm: str = "usdtm"):
+    exchange, _ = _get_sync_exchange_with_markets(_market_forced_usdtm)
+    return exchange
 
 def fetch_ohlcv(ex, symbol, timeframe, limit):
-    ex.load_markets()
+    _ = _get_sync_exchange_with_markets("usdtm")
     return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 # ---------- Settings & argument parsing ----------
@@ -11012,8 +11117,7 @@ def _parse_args_android():
 
 # ---------- Symbols universe (Futures USDT-M only) ----------
 def _pick_symbols(cfg, symbol_override:str|None, max_symbols_hint:int):
-    ex = _build_exchange('usdtm')
-    markets = ex.load_markets()
+    ex, markets = _get_sync_exchange_with_markets('usdtm')
     universe = [s for s,m in markets.items() if m.get("linear") and m.get("quote")=="USDT" and m.get("type")=="swap"]
     ban = ("INU","DOGE","PEPE","FLOKI","BONK","SHIB","BABY","CAT","MOON","MEME")
     universe = [s for s in universe if not any(b in s for b in ban)]
@@ -11077,7 +11181,7 @@ def _android_cli_entry() -> int:
     )
     inputs.console.max_age_bars = max(1, recent_window - 1)
 
-    concurrency = max(1, min(len(symbols), 12))
+    concurrency = max(1, min(len(symbols), 4))
 
     try:
         _, summaries = scan_binance(
