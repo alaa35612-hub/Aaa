@@ -6318,11 +6318,21 @@ class SmartMoneyAlgoProE5:
                 if line_obj in self.lines:
                     self.lines.remove(line_obj)
 
-    def removeZone(self, zoneArray: PineArray, zone: Box, zoneArrayisMit: PineArray, isBull: bool) -> None:
+    def removeZone(
+        self,
+        zoneArray: PineArray,
+        zone: Box,
+        zoneArrayisMit: PineArray,
+        isBull: bool,
+        *,
+        force_remove: bool = False,
+    ) -> None:
         index = zoneArray.indexof(zone)
         if index == -1:
             return
-        if not self.inputs.order_block.showBrkob:
+        if zone.text.strip() in {"IDM OB", "EXT OB"}:
+            self._register_box_event(zone, status="archived", event_time=self.series.get_time())
+        if force_remove or not self.inputs.order_block.showBrkob:
             if zone in self.boxes:
                 self.boxes.remove(zone)
         else:
@@ -6826,7 +6836,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
+                    self.removeZone(
+                        self.demandZone,
+                        self.demandZone.get(idx),
+                        self.demandZoneIsMit,
+                        True,
+                        force_remove=True,
+                    )
                 lstBx_ = self.demandZone.get(idx) if idx != -1 else None
         else:
             idx = -1
@@ -6852,7 +6868,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
+                    self.removeZone(
+                        self.supplyZone,
+                        self.supplyZone.get(idx),
+                        self.supplyZoneIsMit,
+                        False,
+                        force_remove=True,
+                    )
                 lstBx_ = self.supplyZone.get(idx) if idx != -1 else None
 
         colorText = (
@@ -6911,7 +6933,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
+                    self.removeZone(
+                        self.demandZone,
+                        self.demandZone.get(idx),
+                        self.demandZoneIsMit,
+                        True,
+                        force_remove=True,
+                    )
         else:
             idx = -1
             lstPrs = None
@@ -6937,7 +6965,13 @@ class SmartMoneyAlgoProE5:
                     self._register_box_event(zone, status="new")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
-                    self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
+                    self.removeZone(
+                        self.supplyZone,
+                        self.supplyZone.get(idx),
+                        self.supplyZoneIsMit,
+                        False,
+                        force_remove=True,
+                    )
         color = self.inputs.structure.bull if trend else self.inputs.structure.bear
         event_time = self.series.get_time()
         if not math.isnan(y):
@@ -7208,7 +7242,7 @@ class SmartMoneyAlgoProE5:
                 top = max(top, topZone)
                 bot = min(bot, botZone)
                 left = leftZone
-                self.removeZone(zoneArray, zone, zoneArrayisMit, isBull)
+                self.removeZone(zoneArray, zone, zoneArrayisMit, isBull, force_remove=True)
         box_obj = self.createBox(
             left,
             self.series.get_time(),
@@ -7287,12 +7321,19 @@ class SmartMoneyAlgoProE5:
                 if self.inputs.order_block.showBrkob:
                     zones.remove(i)
                     zonesmit.remove(i)
-            elif (
-                (self.series.get_time() - leftZone > self.len * self.maxBarHistory)
-                or (isSupply and self.series.get("high") >= topZone)
-                or ((not isSupply) and self.series.get("low") <= botZone)
-            ):
-                self.removeZone(zones, zone, zonesmit, not isSupply)
+            else:
+                expired = self.series.get_time() - leftZone > self.len * self.maxBarHistory
+                blown = (isSupply and self.series.get("high") >= topZone) or (
+                    (not isSupply) and self.series.get("low") <= botZone
+                )
+                if expired or blown:
+                    self.removeZone(
+                        zones,
+                        zone,
+                        zonesmit,
+                        not isSupply,
+                        force_remove=expired,
+                    )
             i -= 1
         return isAlertextidm
 
