@@ -29,6 +29,7 @@ import datetime
 import inspect
 import json
 import math
+import os
 import re
 import sys
 import textwrap
@@ -42,6 +43,11 @@ try:
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     ccxt = None  # type: ignore
+
+try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    requests = None  # type: ignore
 
 
 # ----------------------------------------------------------------------------
@@ -132,6 +138,498 @@ ICT_STRATEGY_RULES: Dict[str, Any] = {
         "ote_ratio": (0.62, 0.79),
     },
 }
+
+
+# ----------------------------------------------------------------------------
+# Centralised indicator configuration defaults
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class PullbackInputs:
+    showHL: bool = False
+    colorHL: str = "#000000"
+    showMn: bool = False
+
+
+@dataclass
+class MarketStructureInputs:
+    showSMC: bool = True
+    lengSMC: int = 40
+    colorIDM: str = "color.rgb(0, 0, 0, 20)"
+    structure_type: str = "Choch with IDM"
+    showCircleHL: bool = True
+    bull: str = "color.green"
+    bear: str = "color.red"
+
+
+@dataclass
+class OrderBlockInputs:
+    extndBox: bool = True
+    showExob: bool = True
+    showIdmob: bool = True
+    showBrkob: bool = True
+    txtsiz: str = "size.auto"
+    clrtxtextbullbg: str = "color.rgb(76, 175, 79, 86)"
+    clrtxtextbearbg: str = "color.rgb(255, 82, 82, 83)"
+    clrtxtextbulliembg: str = "color.rgb(76, 175, 79, 86)"
+    clrtxtextbeariembg: str = "color.rgb(255, 82, 82, 86)"
+    clrtxtextbull: str = "color.green"
+    clrtxtextbear: str = "color.red"
+    clrtxtextbulliem: str = "color.green"
+    clrtxtextbeariem: str = "color.red"
+    showPOI: bool = True
+    poi_type: str = "Mother Bar"
+    colorSupply: str = "#cd5c4800"
+    colorDemand: str = "#2f825f00"
+    colorMitigated: str = "#c0c0c000"
+    showSCOB: bool = True
+    scobUp: str = "#0b3ff9"
+    scobDn: str = "#da781d"
+
+
+@dataclass
+class DemandSupplyInputs:
+    show_order_blocks: bool = False
+    ibull_ob_css: str = "#5f6b5d19"
+    ibear_ob_css: str = "#ef3a3a19"
+    ob_type__: str = "All"
+    i_tf_ob: str = ""
+    mittigation_filt: str = "wick"
+    overlapping_filt: bool = True
+    max_obs: int = 8
+    length_extend_ob: int = 20
+    ob_extend: bool = False
+    text_size_ob_: str = "size.normal"
+    ob_text_color_1: str = "color.new(#787b86, 0)"
+    volume_text: bool = False
+    percent_text: bool = False
+    show_line_ob_1: bool = False
+    line_style_ob_1: str = "line.style_solid"
+    show_order_blocks_mtf: bool = False
+    ibull_ob_css_2: str = "color.new(#5d606b, 25)"
+    ibear_ob_css_2: str = "color.new(#5d606b, 25)"
+    ob_type__mtf: str = "All"
+    i_tf_ob_mtf: str = "240"
+    mittigation_filt_mtf: str = "Wicks"
+    overlapping_filt_mtf: bool = True
+    max_obs_mtf: int = 4
+    length_extend_ob_mtf: int = 20
+    ob_extend_mtf: bool = False
+    text_size_ob_2: str = "size.small"
+    ob_text_color_2: str = "color.new(#787b86, 0)"
+    volume_text_2: bool = False
+    percent_text_2: bool = False
+    show_line_ob_2: bool = False
+    line_style_ob_2: str = "line.style_solid"
+    v_buy: str = "#00dbff4d"
+    v_sell: str = "#e91e634d"
+    ob_showlast: int = 5
+    iob_showlast: int = 5
+    max_width_ob: float = 3.0
+    style: str = "Colored"
+    v_lookback: int = 10
+    ob_loockback: int = 10
+
+
+@dataclass
+class FVGInputs:
+    show_fvg: bool = False
+    i_tf: str = ""
+    i_mtf: str = "HTF"
+    i_bullishfvgcolor: str = "color.new(color.green,100)"
+    i_bearishfvgcolor: str = "color.new(color.green,90)"
+    remove_small: bool = True
+    mittigation_filt_fvg: str = "Touch"
+    fvg_color_fill: bool = True
+    fvg_shade_fill: bool = False
+    max_fvg: int = 8
+    length_extend: int = 20
+    fvg_extend: bool = False
+    fvg_extend_B: bool = True
+    i_fillByMid: bool = True
+    i_deleteonfill: bool = True
+    i_textColor: str = "color.white"
+    i_tfos: int = 10
+    i_mtfos: int = 50
+    max_width_fvg: float = 1.5
+    i_mtfbearishfvgcolor: str = "color.yellow"
+    i_mtfbullishfvgcolor: str = "color.yellow"
+    mid_style: str = "Solid"
+    i_midPointColor: str = "color.rgb(249, 250, 253, 99)"
+
+
+@dataclass
+class LiquidityInputs:
+    currentTF: bool = False
+    displayLimit: int = 20
+    lowLineColorHTF: str = "#00bbf94d"
+    highLineColorHTF: str = "#e91e624d"
+    htfTF: str = ""
+    _candleType: str = "Close"
+    leftBars: int = 20
+    mitiOptions: str = "Remove"
+    length_extend_liq: int = 20
+    extentionMax: bool = False
+    _highLineStyleHTF: str = "Solid"
+    box_width: float = 2.5
+    lineWidthHTF: int = 2
+    liquidity_text_color: str = "color.black"
+    highBoxBorderColorHTF: str = "color.new(#e91e624d,90)"
+    lowBoxBorderColorHTF: str = "color.new(#00bbf94d,90)"
+    displayStyle_liq: str = "Boxes"
+
+
+@dataclass
+class OrderFlowInputs:
+    showMajoinMiner: bool = False
+    showISOB: bool = True
+    showMajoinMinerMax: int = 10
+    showISOBMax: int = 10
+    showTsted: bool = False
+    maxTested: int = 20
+    ClrMajorOFBull: str = "color.rgb(33, 149, 243, 71)"
+    ClrMajorOFBear: str = "color.rgb(33, 149, 243, 72)"
+    ClrMinorOFBull: str = "color.rgb(155, 39, 176, 81)"
+    ClrMinorOFBear: str = "color.rgb(155, 39, 176, 86)"
+    clrObBBTated: str = "color.rgb(136, 142, 252, 86)"
+
+
+@dataclass
+class CandleInputs:
+    showISB: bool = False
+    colorOSB_up: str = "#0b3ff9"
+    showOSB: bool = False
+    colorOSB_down: str = "#da781d"
+    colorISB: str = "color.rgb(187, 6, 247, 77)"
+    label_color_bearish: str = "color.rgb(255, 82, 82, 90)"
+    label_color_bullish: str = "color.rgb(33, 149, 243, 90)"
+    trendRule: str = "SMA50"
+
+
+@dataclass
+class ConsoleInputs:
+    max_age_bars: int = 1
+
+
+@dataclass
+class StructureInputs:
+    isOTE: bool = False
+    ote1: float = 0.78
+    ote2: float = 0.61
+    oteclr: str = "#ff95002b"
+    sizGd: str = "size.normal"
+    showPdh: bool = False
+    lengPdh: int = 40
+    showPdl: bool = False
+    lengPdl: int = 40
+    showMid: bool = True
+    lengMid: int = 40
+    showSw: bool = True
+    markX: bool = False
+    colorSweep: str = "color.gray"
+    showTP: bool = False
+
+
+@dataclass
+class ICTMarketStructureInputs:
+    showms: bool = False
+    bosColor1: str = "color.green"
+    bosColor2: str = "color.red"
+    ms_type: str = "All"
+    show_equal_highlow: bool = False
+    eq_bear_color: str = "#787b86"
+    eq_bull_color: str = "#787b86"
+    eq_threshold: float = 0.3
+    label_sizes_s: str = "Medium"
+    swingSize: int = 10
+    showSwing: bool = False
+
+
+@dataclass
+class KeyLevelsInputs:
+    Show_4H_Levels: bool = False
+    Color_4H_Levels: str = "color.orange"
+    Style_4H_Levels: str = "Dotted"
+    Text_4H_Levels: bool = True
+    Show_Daily_Levels: bool = False
+    Color_Daily_Levels: str = "#08bcd4"
+    Style_Daily_Levels: str = "Dotted"
+    Text_Daily_Levels: bool = True
+    Show_Monday_Levels: bool = False
+    Color_Monday_Levels: str = "color.white"
+    Style_Monday_Levels: str = "Dotted"
+    Text_Monday_Levels: bool = True
+    Show_Weekly_Levels: bool = False
+    WeeklyColor: str = "#fffcbc"
+    Weekly_style: str = "Dotted"
+    WeeklyTextType: bool = True
+    Show_Monthly_Levels: bool = False
+    MonthlyColor: str = "#098c30"
+    Monthly_style: str = "Dotted"
+    MonthlyTextType: bool = True
+    Show_Quaterly_Levels: bool = False
+    quarterlyColor: str = "#bcffd0"
+    Quaterly_style: str = "Dotted"
+    QuarterlyTextType: bool = True
+    Show_Yearly_Levels: bool = False
+    YearlyColor: str = "#ffbcdb"
+    Yearly_style: str = "Dotted"
+    YearlyTextType: bool = True
+    labelsize: str = "Small"
+    displayStyle: str = "Standard"
+    distanceright: int = 25
+    radistance: int = 250
+    linesize: str = "Small"
+    linestyle: str = "Solid"
+
+
+@dataclass
+class SessionInputs:
+    is_londonrange_enabled: bool = False
+    london_OC: bool = True
+    london_HL: bool = True
+    is_usrange_enabled: bool = False
+    us_OC: bool = True
+    us_HL: bool = True
+    is_tokyorange_enabled: bool = False
+    asia_OC: bool = True
+    asia_HL: bool = True
+    SessionTextType: bool = False
+    Londont: str = "0800-1600"
+    USt: str = "1400-2100"
+    Asiat: str = "0000-0900"
+    LondonColor: str = "color.rgb(15, 13, 13)"
+    USColor: str = "color.rgb(190, 8, 236)"
+    AsiaColor: str = "color.rgb(33, 5, 241)"
+    Short_text_London: bool = True
+    Short_text_NY: bool = True
+    Short_text_TKY: bool = True
+
+
+@dataclass
+class SwingDetectionInputs:
+    cooldownPeriod: int = 10
+    showSwing_: bool = True
+    swingClr: str = "color.new(color.orange, 0)"
+    bullWidth: int = 1
+    bullStyle: str = "Dashed"
+    bullColor: str = "color.new(color.teal, 0)"
+    bearWidth: int = 1
+    bearStyle: str = "Dashed"
+    bearColor: str = "color.new(color.maroon, 0)"
+    display_third: bool = False
+    length3: int = 20
+    mult: float = 1.0
+    atr_Len: int = 500
+    upCss: str = "#089981"
+    dnCss: str = "#f23645"
+    unbrokenCss: str = "#2157f3"
+
+
+@dataclass
+class ZigZagInputs:
+    length1: int = 100
+    extend: bool = True
+    show_ext: bool = True
+    show_labels: bool = True
+    upcol: str = "#ff1100"
+    midcol: str = "#ff5d00"
+    dncol: str = "#2157f3"
+
+
+@dataclass
+class SupportResistanceInputs:
+    resistanceSupportCount: int = 3
+    pivotRange: int = 15
+    strength: int = 1
+    expandLines: bool = True
+    enableZones: bool = False
+    zoneWidthType: str = "Dynamic"
+    zoneWidth: int = 1
+    timeframe1Enabled: bool = True
+    timeframe1_: str = ""
+    timeframe2Enabled: bool = True
+    timeframe2: str = "240"
+    timeframe3Enabled: bool = False
+    timeframe3: str = "30"
+    showBreaks: bool = True
+    showRetests: bool = True
+    avoidFalseBreaks: bool = True
+    falseBreakoutVolumeThresholdOpt: float = 0.3
+    inverseBrokenLineColor: bool = True
+    lineStyle_: str = "...."
+    lineWidth: int = 1
+    supportColor: str = "#08998180"
+    resistanceColor: str = "#f2364580"
+    textColor: str = "#11101051"
+    labelsize: str = "Small"
+    labelsAlign: str = "Right"
+    enableRetestAlerts: bool = True
+    enableBreakAlerts: bool = True
+    memoryOptimizatonEnabled: bool = True
+    debug_labelPivots: str = "None"
+    debug_pivotLabelText: bool = False
+    debug_showBrokenOnLabel: bool = False
+    debug_removeDuplicateRS: bool = True
+    debug_lastXResistances: int = 3
+    debug_lastXSupports: int = 3
+    debug_enabledHistory: bool = True
+    debug_maxHistoryRecords: int = 10
+
+
+@dataclass
+class IndicatorInputs:
+    pullback: PullbackInputs = field(default_factory=PullbackInputs)
+    structure: MarketStructureInputs = field(default_factory=MarketStructureInputs)
+    order_block: OrderBlockInputs = field(default_factory=OrderBlockInputs)
+    demand_supply: DemandSupplyInputs = field(default_factory=DemandSupplyInputs)
+    fvg: FVGInputs = field(default_factory=FVGInputs)
+    liquidity: LiquidityInputs = field(default_factory=LiquidityInputs)
+    order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
+    candle: CandleInputs = field(default_factory=CandleInputs)
+    console: ConsoleInputs = field(default_factory=ConsoleInputs)
+    structure_util: StructureInputs = field(default_factory=StructureInputs)
+    ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
+    key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
+    sessions: SessionInputs = field(default_factory=SessionInputs)
+    swing_detection: SwingDetectionInputs = field(default_factory=SwingDetectionInputs)
+    zigzag: ZigZagInputs = field(default_factory=ZigZagInputs)
+    support_resistance: SupportResistanceInputs = field(default_factory=SupportResistanceInputs)
+
+
+# ----------------------------------------------------------------------------
+# Scanner, CLI, and automation defaults
+# ----------------------------------------------------------------------------
+
+
+_MEME_BASES = {
+    "DOGE",
+    "SHIB",
+    "PEPE",
+    "FLOKI",
+    "BONK",
+    "WIF",
+    "BABYDOGE",
+    "MOG",
+    "DEGEN",
+    "PONKE",
+    "BODEN",
+    "MEME",
+    "AIDOGE",
+    "MEOW",
+    "GME",
+    "TOSHI",
+    "HOPPY",
+    "KITTY",
+    "LADYS",
+    "CREAM",
+    "PIPI",
+    "JEET",
+    "CHILLGUY",
+    "HUAHUA",
+}
+
+_DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
+
+
+@dataclass(frozen=True)
+class _EditorAutorunDefaults:
+    timeframe: str = "1m"
+    candle_limit: int = 600
+    max_symbols: int = 60
+    recent_bars: int = 2
+
+
+EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
+
+
+@dataclass
+class _CLISettings:
+    # indicator toggles mirrored from the Pine port
+    showHL: bool = False
+    showMn: bool = False
+    showISOB: bool = True
+    showMajoinMiner: bool = False
+    showCircleHL: bool = True
+    showSMC: bool = True
+    lengSMC: int = 40
+    swing_size: int = 10
+    show_fvg: bool = True
+    show_liquidity: bool = True
+    liquidity_display_limit: int = 20
+    drop_last_incomplete: bool = False
+    # scanner controls
+    tg_enable: bool = False
+    tg_title_prefix: str = "SMC Alert"
+    # matching indicator behaviour
+    ob_test_mode: str = "CLOSE"
+    zone_type: str = "Mother Bar"
+    bos_confirmation: str = "Close"
+    strict_close_for_break: bool = False
+    # filters
+    market: str = "usdtm"
+    min_change: float = 5.0
+    min_volume: float = 30_000_000.0
+    max_scan: int = 60
+    allow_meme: bool = False
+    exclude_symbols: str = ""
+    exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
+    include_only: str = ""
+
+
+@dataclass
+class BinanceSymbolSelectorConfig:
+    """User-facing switches controlling Binance symbol prioritisation."""
+
+    prioritize_top_gainers: bool = True
+    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
+    top_gainer_threshold: float = 5.0
+    top_gainer_scope: str = "24h"
+
+
+DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
+
+
+# Console report labelling and ordering
+METRIC_LABELS = [
+    ("alerts", "عدد التنبيهات"),
+    ("pullback_arrows", "إشارات Pullback"),
+    ("choch_labels", "علامات CHoCH"),
+    ("bos_labels", "علامات BOS"),
+    ("idm_labels", "علامات IDM"),
+    ("demand_zones", "مناطق الطلب"),
+    ("supply_zones", "مناطق العرض"),
+    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
+    ("idm_ob_touched", "IDM OB تم ملامستها"),
+    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
+    ("ext_ob_touched", "EXT OB تم ملامستها"),
+    ("bullish_fvg", "فجوات FVG صاعدة"),
+    ("bearish_fvg", "فجوات FVG هابطة"),
+    ("order_flow_boxes", "صناديق Order Flow"),
+    ("liquidity_objects", "مستويات السيولة"),
+    ("scob_colored_bars", "شموع SCOB"),
+]
+
+
+EVENT_DISPLAY_ORDER = [
+    ("BOS", "BOS"),
+    ("BOS_PLUS", "BOS+"),
+    ("CHOCH", "CHOCH"),
+    ("MSS_PLUS", "MSS+"),
+    ("MSS", "MSS"),
+    ("IDM", "IDM"),
+    ("IDM_OB", "IDM OB"),
+    ("EXT_OB", "EXT OB"),
+    ("HIST_IDM_OB", "Hist IDM OB"),
+    ("HIST_EXT_OB", "Hist EXT OB"),
+    ("GOLDEN_ZONE", "Golden zone"),
+    ("X", "X"),
+    ("RED_CIRCLE", "الدوائر الحمراء"),
+    ("GREEN_CIRCLE", "الدوائر الخضراء"),
+    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
+    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
+]
 
 
 def _normalize_direction(value: Any) -> Optional[str]:
@@ -698,394 +1196,6 @@ class Box:
 
     def get_right(self) -> int:
         return self.right
-
-
-# ----------------------------------------------------------------------------
-# Indicator inputs (1:1 with Pine defaults for targeted packages)
-# ----------------------------------------------------------------------------
-
-
-@dataclass
-class PullbackInputs:
-    showHL: bool = False
-    colorHL: str = "#000000"
-    showMn: bool = False
-
-
-@dataclass
-class MarketStructureInputs:
-    showSMC: bool = True
-    lengSMC: int = 40
-    colorIDM: str = "color.rgb(0, 0, 0, 20)"
-    structure_type: str = "Choch with IDM"
-    showCircleHL: bool = True
-    bull: str = "color.green"
-    bear: str = "color.red"
-
-
-@dataclass
-class OrderBlockInputs:
-    extndBox: bool = True
-    showExob: bool = True
-    showIdmob: bool = True
-    showBrkob: bool = True
-    txtsiz: str = "size.auto"
-    clrtxtextbullbg: str = "color.rgb(76, 175, 79, 86)"
-    clrtxtextbearbg: str = "color.rgb(255, 82, 82, 83)"
-    clrtxtextbulliembg: str = "color.rgb(76, 175, 79, 86)"
-    clrtxtextbeariembg: str = "color.rgb(255, 82, 82, 86)"
-    clrtxtextbull: str = "color.green"
-    clrtxtextbear: str = "color.red"
-    clrtxtextbulliem: str = "color.green"
-    clrtxtextbeariem: str = "color.red"
-    showPOI: bool = True
-    poi_type: str = "Mother Bar"
-    colorSupply: str = "#cd5c4800"
-    colorDemand: str = "#2f825f00"
-    colorMitigated: str = "#c0c0c000"
-    showSCOB: bool = True
-    scobUp: str = "#0b3ff9"
-    scobDn: str = "#da781d"
-
-
-@dataclass
-class DemandSupplyInputs:
-    show_order_blocks: bool = False
-    ibull_ob_css: str = "#5f6b5d19"
-    ibear_ob_css: str = "#ef3a3a19"
-    ob_type__: str = "All"
-    i_tf_ob: str = ""
-    mittigation_filt: str = "wick"
-    overlapping_filt: bool = True
-    max_obs: int = 8
-    length_extend_ob: int = 20
-    ob_extend: bool = False
-    text_size_ob_: str = "size.normal"
-    ob_text_color_1: str = "color.new(#787b86, 0)"
-    volume_text: bool = False
-    percent_text: bool = False
-    show_line_ob_1: bool = False
-    line_style_ob_1: str = "line.style_solid"
-    show_order_blocks_mtf: bool = False
-    ibull_ob_css_2: str = "color.new(#5d606b, 25)"
-    ibear_ob_css_2: str = "color.new(#5d606b, 25)"
-    ob_type__mtf: str = "All"
-    i_tf_ob_mtf: str = "240"
-    mittigation_filt_mtf: str = "Wicks"
-    overlapping_filt_mtf: bool = True
-    max_obs_mtf: int = 4
-    length_extend_ob_mtf: int = 20
-    ob_extend_mtf: bool = False
-    text_size_ob_2: str = "size.small"
-    ob_text_color_2: str = "color.new(#787b86, 0)"
-    volume_text_2: bool = False
-    percent_text_2: bool = False
-    show_line_ob_2: bool = False
-    line_style_ob_2: str = "line.style_solid"
-    v_buy: str = "#00dbff4d"
-    v_sell: str = "#e91e634d"
-    ob_showlast: int = 5
-    iob_showlast: int = 5
-    max_width_ob: float = 3.0
-    style: str = "Colored"
-    v_lookback: int = 10
-    ob_loockback: int = 10
-
-
-@dataclass
-class FVGInputs:
-    show_fvg: bool = False
-    i_tf: str = ""
-    i_mtf: str = "HTF"
-    i_bullishfvgcolor: str = "color.new(color.green,100)"
-    i_bearishfvgcolor: str = "color.new(color.green,90)"
-    remove_small: bool = True
-    mittigation_filt_fvg: str = "Touch"
-    fvg_color_fill: bool = True
-    fvg_shade_fill: bool = False
-    max_fvg: int = 8
-    length_extend: int = 20
-    fvg_extend: bool = False
-    fvg_extend_B: bool = True
-    i_fillByMid: bool = True
-    i_deleteonfill: bool = True
-    i_textColor: str = "color.white"
-    i_tfos: int = 10
-    i_mtfos: int = 50
-    max_width_fvg: float = 1.5
-    i_mtfbearishfvgcolor: str = "color.yellow"
-    i_mtfbullishfvgcolor: str = "color.yellow"
-    mid_style: str = "Solid"
-    i_midPointColor: str = "color.rgb(249, 250, 253, 99)"
-
-
-@dataclass
-class LiquidityInputs:
-    currentTF: bool = False
-    displayLimit: int = 20
-    lowLineColorHTF: str = "#00bbf94d"
-    highLineColorHTF: str = "#e91e624d"
-    htfTF: str = ""
-    _candleType: str = "Close"
-    leftBars: int = 20
-    mitiOptions: str = "Remove"
-    length_extend_liq: int = 20
-    extentionMax: bool = False
-    _highLineStyleHTF: str = "Solid"
-    box_width: float = 2.5
-    lineWidthHTF: int = 2
-    liquidity_text_color: str = "color.black"
-    highBoxBorderColorHTF: str = "color.new(#e91e624d,90)"
-    lowBoxBorderColorHTF: str = "color.new(#00bbf94d,90)"
-    displayStyle_liq: str = "Boxes"
-
-
-@dataclass
-class OrderFlowInputs:
-    showMajoinMiner: bool = False
-    showISOB: bool = True
-    showMajoinMinerMax: int = 10
-    showISOBMax: int = 10
-    showTsted: bool = False
-    maxTested: int = 20
-    ClrMajorOFBull: str = "color.rgb(33, 149, 243, 71)"
-    ClrMajorOFBear: str = "color.rgb(33, 149, 243, 72)"
-    ClrMinorOFBull: str = "color.rgb(155, 39, 176, 81)"
-    ClrMinorOFBear: str = "color.rgb(155, 39, 176, 86)"
-    clrObBBTated: str = "color.rgb(136, 142, 252, 86)"
-
-
-@dataclass
-class CandleInputs:
-    showISB: bool = False
-    colorOSB_up: str = "#0b3ff9"
-    showOSB: bool = False
-    colorOSB_down: str = "#da781d"
-    colorISB: str = "color.rgb(187, 6, 247, 77)"
-    label_color_bearish: str = "color.rgb(255, 82, 82, 90)"
-    label_color_bullish: str = "color.rgb(33, 149, 243, 90)"
-    trendRule: str = "SMA50"
-
-
-@dataclass
-class ConsoleInputs:
-    max_age_bars: int = 1
-
-
-@dataclass
-class StructureInputs:
-    isOTE: bool = False
-    ote1: float = 0.78
-    ote2: float = 0.61
-    oteclr: str = "#ff95002b"
-    sizGd: str = "size.normal"
-    showPdh: bool = False
-    lengPdh: int = 40
-    showPdl: bool = False
-    lengPdl: int = 40
-    showMid: bool = True
-    lengMid: int = 40
-    showSw: bool = True
-    markX: bool = False
-    colorSweep: str = "color.gray"
-    showTP: bool = False
-
-
-@dataclass
-class ICTMarketStructureInputs:
-    showms: bool = False
-    bosColor1: str = "color.green"
-    bosColor2: str = "color.red"
-    ms_type: str = "All"
-    show_equal_highlow: bool = False
-    eq_bear_color: str = "#787b86"
-    eq_bull_color: str = "#787b86"
-    eq_threshold: float = 0.3
-    label_sizes_s: str = "Medium"
-    swingSize: int = 10
-    showSwing: bool = False
-
-
-@dataclass
-class KeyLevelsInputs:
-    Show_4H_Levels: bool = False
-    Color_4H_Levels: str = "color.orange"
-    Style_4H_Levels: str = "Dotted"
-    Text_4H_Levels: bool = True
-    Show_Daily_Levels: bool = False
-    Color_Daily_Levels: str = "#08bcd4"
-    Style_Daily_Levels: str = "Dotted"
-    Text_Daily_Levels: bool = True
-    Show_Monday_Levels: bool = False
-    Color_Monday_Levels: str = "color.white"
-    Style_Monday_Levels: str = "Dotted"
-    Text_Monday_Levels: bool = True
-    Show_Weekly_Levels: bool = False
-    WeeklyColor: str = "#fffcbc"
-    Weekly_style: str = "Dotted"
-    WeeklyTextType: bool = True
-    Show_Monthly_Levels: bool = False
-    MonthlyColor: str = "#098c30"
-    Monthly_style: str = "Dotted"
-    MonthlyTextType: bool = True
-    Show_Quaterly_Levels: bool = False
-    quarterlyColor: str = "#bcffd0"
-    Quaterly_style: str = "Dotted"
-    QuarterlyTextType: bool = True
-    Show_Yearly_Levels: bool = False
-    YearlyColor: str = "#ffbcdb"
-    Yearly_style: str = "Dotted"
-    YearlyTextType: bool = True
-    labelsize: str = "Small"
-    displayStyle: str = "Standard"
-    distanceright: int = 25
-    radistance: int = 250
-    linesize: str = "Small"
-    linestyle: str = "Solid"
-
-
-@dataclass
-class SessionInputs:
-    is_londonrange_enabled: bool = False
-    london_OC: bool = True
-    london_HL: bool = True
-    is_usrange_enabled: bool = False
-    us_OC: bool = True
-    us_HL: bool = True
-    is_tokyorange_enabled: bool = False
-    asia_OC: bool = True
-    asia_HL: bool = True
-    SessionTextType: bool = False
-    Londont: str = "0800-1600"
-    USt: str = "1400-2100"
-    Asiat: str = "0000-0900"
-    LondonColor: str = "color.rgb(15, 13, 13)"
-    USColor: str = "color.rgb(190, 8, 236)"
-    AsiaColor: str = "color.rgb(33, 5, 241)"
-    Short_text_London: bool = True
-    Short_text_NY: bool = True
-    Short_text_TKY: bool = True
-
-
-@dataclass
-class SwingDetectionInputs:
-    cooldownPeriod: int = 10
-    showSwing_: bool = True
-    swingClr: str = "color.new(color.orange, 0)"
-    bullWidth: int = 1
-    bullStyle: str = "Dashed"
-    bullColor: str = "color.new(color.teal, 0)"
-    bearWidth: int = 1
-    bearStyle: str = "Dashed"
-    bearColor: str = "color.new(color.maroon, 0)"
-    display_third: bool = False
-    length3: int = 20
-    mult: float = 1.0
-    atr_Len: int = 500
-    upCss: str = "#089981"
-    dnCss: str = "#f23645"
-    unbrokenCss: str = "#2157f3"
-
-
-@dataclass
-class ZigZagInputs:
-    length1: int = 100
-    extend: bool = True
-    show_ext: bool = True
-    show_labels: bool = True
-    upcol: str = "#ff1100"
-    midcol: str = "#ff5d00"
-    dncol: str = "#2157f3"
-
-
-@dataclass
-class SupportResistanceInputs:
-    resistanceSupportCount: int = 3
-    pivotRange: int = 15
-    strength: int = 1
-    expandLines: bool = True
-    enableZones: bool = False
-    zoneWidthType: str = "Dynamic"
-    zoneWidth: int = 1
-    timeframe1Enabled: bool = True
-    timeframe1_: str = ""
-    timeframe2Enabled: bool = True
-    timeframe2: str = "240"
-    timeframe3Enabled: bool = False
-    timeframe3: str = "30"
-    showBreaks: bool = True
-    showRetests: bool = True
-    avoidFalseBreaks: bool = True
-    falseBreakoutVolumeThresholdOpt: float = 0.3
-    inverseBrokenLineColor: bool = True
-    lineStyle_: str = "...."
-    lineWidth: int = 1
-    supportColor: str = "#08998180"
-    resistanceColor: str = "#f2364580"
-    textColor: str = "#11101051"
-    labelsize: str = "Small"
-    labelsAlign: str = "Right"
-    enableRetestAlerts: bool = True
-    enableBreakAlerts: bool = True
-    memoryOptimizatonEnabled: bool = True
-    debug_labelPivots: str = "None"
-    debug_pivotLabelText: bool = False
-    debug_showBrokenOnLabel: bool = False
-    debug_removeDuplicateRS: bool = True
-    debug_lastXResistances: int = 3
-    debug_lastXSupports: int = 3
-    debug_enabledHistory: bool = True
-    debug_maxHistoryRecords: int = 10
-
-
-@dataclass
-class CustomPoint:
-    time: int
-    price: float
-    tr: float
-
-
-@dataclass
-class SupportResistanceLevel:
-    rs_type: str
-    timeframe: str
-    price: float
-    points: List[CustomPoint] = field(default_factory=list)
-    line: Optional[Line] = None
-    box: Optional[Box] = None
-    price_label: Optional[Label] = None
-    break_label: Optional[Label] = None
-    break_line: Optional[Line] = None
-    break_box: Optional[Box] = None
-    retest_labels: List[Label] = field(default_factory=list)
-    is_broken: bool = False
-    broken_time: Optional[int] = None
-    break_level: Optional[float] = None
-    break_tr: float = 0.0
-    last_retest_time: Optional[int] = None
-    last_retest_bar: Optional[int] = None
-    last_break_alert_time: Optional[int] = None
-    last_retest_alert_time: Optional[int] = None
-
-
-@dataclass
-class IndicatorInputs:
-    pullback: PullbackInputs = field(default_factory=PullbackInputs)
-    structure: MarketStructureInputs = field(default_factory=MarketStructureInputs)
-    order_block: OrderBlockInputs = field(default_factory=OrderBlockInputs)
-    demand_supply: DemandSupplyInputs = field(default_factory=DemandSupplyInputs)
-    fvg: FVGInputs = field(default_factory=FVGInputs)
-    liquidity: LiquidityInputs = field(default_factory=LiquidityInputs)
-    order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
-    candle: CandleInputs = field(default_factory=CandleInputs)
-    console: ConsoleInputs = field(default_factory=ConsoleInputs)
-    structure_util: StructureInputs = field(default_factory=StructureInputs)
-    ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
-    key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
-    sessions: SessionInputs = field(default_factory=SessionInputs)
-    swing_detection: SwingDetectionInputs = field(default_factory=SwingDetectionInputs)
-    zigzag: ZigZagInputs = field(default_factory=ZigZagInputs)
-    support_resistance: SupportResistanceInputs = field(default_factory=SupportResistanceInputs)
 
 
 @dataclass
@@ -7296,17 +7406,7 @@ class SmartMoneyAlgoProE5:
 # ----------------------------------------------------------------------------
 
 
-@dataclass
-class BinanceSymbolSelectorConfig:
-    """User-facing switches controlling Binance symbol prioritisation."""
 
-    prioritize_top_gainers: bool = True
-    top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
-    top_gainer_threshold: float = 5.0
-    top_gainer_scope: str = "24h"
-
-
-DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig()
 
 
 def _safe_symbol_metric(value: Any) -> Optional[float]:
@@ -8385,46 +8485,6 @@ def run_runtime_from_file(
     render_report(runtime, outfile)
 
 
-METRIC_LABELS = [
-    ("alerts", "عدد التنبيهات"),
-    ("pullback_arrows", "إشارات Pullback"),
-    ("choch_labels", "علامات CHoCH"),
-    ("bos_labels", "علامات BOS"),
-    ("idm_labels", "علامات IDM"),
-    ("demand_zones", "مناطق الطلب"),
-    ("supply_zones", "مناطق العرض"),
-    ("idm_ob_new", "IDM OB تم إنشائها حديثاً"),
-    ("idm_ob_touched", "IDM OB تم ملامستها"),
-    ("ext_ob_new", "EXT OB تم إنشائها حديثاً"),
-    ("ext_ob_touched", "EXT OB تم ملامستها"),
-    ("bullish_fvg", "فجوات FVG صاعدة"),
-    ("bearish_fvg", "فجوات FVG هابطة"),
-    ("order_flow_boxes", "صناديق Order Flow"),
-    ("liquidity_objects", "مستويات السيولة"),
-    ("scob_colored_bars", "شموع SCOB"),
-]
-
-
-EVENT_DISPLAY_ORDER = [
-    ("BOS", "BOS"),
-    ("BOS_PLUS", "BOS+"),
-    ("CHOCH", "CHOCH"),
-    ("MSS_PLUS", "MSS+"),
-    ("MSS", "MSS"),
-    ("IDM", "IDM"),
-    ("IDM_OB", "IDM OB"),
-    ("EXT_OB", "EXT OB"),
-    ("HIST_IDM_OB", "Hist IDM OB"),
-    ("HIST_EXT_OB", "Hist EXT OB"),
-    ("GOLDEN_ZONE", "Golden zone"),
-    ("X", "X"),
-    ("RED_CIRCLE", "الدوائر الحمراء"),
-    ("GREEN_CIRCLE", "الدوائر الخضراء"),
-    ("FUTURE_BOS", "ليبل BOS المستقبلي"),
-    ("FUTURE_CHOCH", "ليبل CHOCH المستقبلي"),
-]
-
-
 def print_symbol_summary(index: int, symbol: str, timeframe: str, candle_count: int, metrics: Dict[str, Any]) -> None:
     header_color = ANSI_HEADER_COLORS[index % len(ANSI_HEADER_COLORS)]
     symbol_display = _format_symbol(symbol)
@@ -9190,24 +9250,6 @@ except Exception:
     requests = None  # type: ignore
 
 # ----------------------------- Filters & Helpers -----------------------------
-_MEME_BASES = {
-    "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BABYDOGE","MOG","DEGEN","PONKE","BODEN","MEME",
-    "AIDOGE","MEOW","GME","TOSHI","HOPPY","KITTY","LADYS","CREAM","PIPI","JEET","CHILLGUY","HUAHUA"
-}
-_DEFAULT_EXCLUDE_PATTERNS = "INU,DOGE,PEPE,FLOKI,BONK,SHIB,BABY,CAT,MOON,MEME"
-
-
-@dataclass(frozen=True)
-class _EditorAutorunDefaults:
-    timeframe: str = "1m"
-    candle_limit: int = 600
-    max_symbols: int = 60
-    recent_bars: int = 2
-
-
-EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults()
-
-
 def _pct_24h(t: Dict) -> float:
     v = t.get("percentage")
     if v is None and isinstance(t.get("info"), dict):
@@ -9239,39 +9281,6 @@ def _normalize_list(csv_like: str) -> List[str]:
     return [x.strip().upper() for x in csv_like.split(",") if x.strip()]
 
 # ----------------------------- CLI Settings ----------------------------------
-@dataclass
-class _CLISettings:
-    # indicator toggles that exist in port (wired where safe)
-    showHL: bool = False
-    showMn: bool = False
-    showISOB: bool = True
-    showMajoinMiner: bool = False
-    showCircleHL: bool = True
-    showSMC: bool = True
-    lengSMC: int = 40
-    swing_size: int = 10
-    show_fvg: bool = True
-    show_liquidity: bool = True
-    liquidity_display_limit: int = 20
-    drop_last_incomplete: bool = False
-    # scanner controls
-    tg_enable: bool = False
-    tg_title_prefix: str = "SMC Alert"
-    # matching indicator behavior
-    ob_test_mode: str = "CLOSE"  # goes to demand_supply.mittigation_filt (canonicalized inside)
-    zone_type: str = "Mother Bar"  # goes to order_block.poi_type
-    bos_confirmation: str = "Close"
-    strict_close_for_break: bool = False
-    # filters
-    market: str = "usdtm"         # {usdtm, spot}
-    min_change: float = 5.0       # ≥ %
-    min_volume: float = 30_000_000.0  # ≥ USDT
-    max_scan: int = 60            # after filtering & sorting
-    allow_meme: bool = False
-    exclude_symbols: str = ""
-    exclude_patterns: str = _DEFAULT_EXCLUDE_PATTERNS
-    include_only: str = ""
-
 def _get_secret(name: str) -> Optional[str]:
     return os.environ.get(name)
 
