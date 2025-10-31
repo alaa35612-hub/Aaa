@@ -122,8 +122,19 @@ class ICTScannerSettings:
     max_symbols: int = 60
 
 
+@dataclass
+class ICTPerformanceSettings:
+    enabled: bool = True
+    metric_name: str = "percentage"
+    minimum_value: float = 5.0
+    top_n: int = 10
+    prefer_positive: bool = True
+    display_units: str = "%"
+
+
 ICT_STRATEGY_SETTINGS = ICTStrategySettings()
 ICT_SCANNER_SETTINGS = ICTScannerSettings()
+ICT_PERFORMANCE_SETTINGS = ICTPerformanceSettings()
 
 
 ICT_STRATEGY_RULES: Dict[str, Any] = {
@@ -163,6 +174,13 @@ ICT_STRATEGY_RULES: Dict[str, Any] = {
         "require_ote": ICT_STRATEGY_SETTINGS.require_ote,
         "allow_order_block": ICT_STRATEGY_SETTINGS.allow_order_block,
         "allow_fvg": ICT_STRATEGY_SETTINGS.allow_fvg,
+    },
+    "performance": {
+        "metric": ICT_PERFORMANCE_SETTINGS.metric_name,
+        "minimum": ICT_PERFORMANCE_SETTINGS.minimum_value,
+        "top_n": ICT_PERFORMANCE_SETTINGS.top_n,
+        "prefer_positive": ICT_PERFORMANCE_SETTINGS.prefer_positive,
+        "display_units": ICT_PERFORMANCE_SETTINGS.display_units,
     },
 }
 
@@ -8545,6 +8563,25 @@ def _extract_daily_change_percent(ticker: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _extract_performance_metric(
+    ticker: Dict[str, Any],
+    settings: ICTPerformanceSettings = ICT_PERFORMANCE_SETTINGS,
+) -> Optional[float]:
+    metric = settings.metric_name
+    if not isinstance(metric, str) or not metric:
+        return None
+    metric = metric.strip()
+    if metric.lower() == "percentage":
+        return _extract_daily_change_percent(ticker)
+    value: Any = ticker.get(metric) if isinstance(ticker, dict) else None
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _collect_recent_event_hits(
     series: Any,
     latest_events: Any,
@@ -8643,6 +8680,109 @@ def print_strategy_match_overview(
         details = " — ".join(part for part in (setup, ote_text) if part)
         print(
             f"    → {color}{direction_label}{ANSI_RESET} @ {price_text}" + (f" | {details}" if details else ""),
+            flush=True,
+        )
+
+
+def print_performance_rankings(
+    summaries: Sequence[Dict[str, Any]],
+    settings: ICTPerformanceSettings = ICT_PERFORMANCE_SETTINGS,
+) -> None:
+    if not settings.enabled:
+        return
+
+    metric_name = settings.metric_name or "metric"
+    metric_name = metric_name.strip() or "metric"
+    header = f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric_name}'"
+    print(header, flush=True)
+    threshold = settings.minimum_value
+    if threshold is not None:
+        try:
+            print(f"{metric_name}: {float(threshold):.2f}", flush=True)
+        except (TypeError, ValueError):
+            print(f"{metric_name}: {threshold}", flush=True)
+
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+    for summary in summaries:
+        if not isinstance(summary, dict):
+            continue
+        matches = summary.get("matches") or []
+        if not matches:
+            continue
+        metric_value = summary.get("metric_value")
+        if metric_value is None:
+            continue
+        try:
+            metric_value = float(metric_value)
+        except (TypeError, ValueError):
+            continue
+        if settings.prefer_positive:
+            if threshold is not None and metric_value < threshold:
+                continue
+        else:
+            if threshold is not None and metric_value > threshold:
+                continue
+        candidates.append((metric_value, summary))
+
+    if not candidates:
+        print("لا توجد رموز متوافقة تتجاوز شرط المقياس المحدد.", flush=True)
+        return
+
+    candidates.sort(key=lambda item: item[0], reverse=settings.prefer_positive)
+    if settings.top_n and settings.top_n > 0:
+        candidates = candidates[: settings.top_n]
+
+    units = settings.display_units or ""
+    if units and not units.startswith(" "):
+        units = units.strip()
+
+    for rank, (metric_value, summary) in enumerate(candidates, 1):
+        symbol = summary.get("symbol", "?")
+        symbol_display = _format_symbol(str(symbol))
+        matches = summary.get("matches") or []
+        raw_match = matches[0]
+        if isinstance(raw_match, ICTStrategyMatch):
+            first_match = raw_match.as_dict()
+        elif isinstance(raw_match, dict):
+            first_match = raw_match
+        else:
+            first_match = {}
+
+        direction_token = first_match.get("direction")
+        resolved_dir = _normalize_direction(direction_token) if direction_token else None
+        if resolved_dir == "bullish":
+            direction_label = "صعودي"
+        elif resolved_dir == "bearish":
+            direction_label = "هبوطي"
+        else:
+            direction_label = str(direction_token or "اتجاه")
+        colored_direction = _colorize_directional_text(direction_label, direction=direction_token)
+
+        entry_price = first_match.get("entry_price", first_match.get("price"))
+        price_text = format_price(entry_price if isinstance(entry_price, (int, float)) else None)
+
+        metric_suffix = units
+        if metric_suffix:
+            metric_suffix = metric_suffix.strip()
+            if metric_suffix and not metric_suffix.startswith("%"):
+                metric_suffix = f" {metric_suffix}"
+            elif metric_suffix == "%":
+                metric_suffix = "%"
+
+        setup = first_match.get("setup", "")
+        ote_range = first_match.get("ote_range")
+        ote_text = ""
+        if isinstance(ote_range, (list, tuple)) and len(ote_range) == 2:
+            ote_text = f"OTE: {format_price(ote_range[0])} → {format_price(ote_range[1])}"
+
+        details_parts = [part for part in (setup, ote_text) if part]
+        details = f" | {' — '.join(details_parts)}" if details_parts else ""
+
+        metric_display = (
+            f"{metric_value:.2f}{metric_suffix}" if isinstance(metric_value, (int, float)) else str(metric_value)
+        )
+        print(
+            f" {rank}. {symbol_display} | {colored_direction} | دخول: {price_text} | {metric_name}: {metric_display}{details}",
             flush=True,
         )
 
@@ -8834,8 +8974,15 @@ def detect_ict_strategy(
     bearish_fvg_boxes = _collect_fvg_boxes(runtime_ltf, False)
 
     # Long setup ------------------------------------------------------------
-    bos_event = htf_events.get("BOS") if isinstance(htf_events, dict) else None
-    bullish_htf = bos_event if isinstance(bos_event, dict) and bos_event.get("direction") == "bullish" else None
+    bullish_event: Optional[Dict[str, Any]] = None
+    bullish_key = None
+    if isinstance(htf_events, dict):
+        for candidate in ("BOS", "CHOCH"):
+            event = htf_events.get(candidate)
+            if isinstance(event, dict) and event.get("direction") in ("bullish", "long"):
+                bullish_event = event
+                bullish_key = candidate
+                break
     sweep_sell = (
         sweep_event
         if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "sell-side"
@@ -8857,19 +9004,20 @@ def detect_ict_strategy(
     sweep_sell_ok = sweep_sell is not None or not require_liquidity_sweep
 
     if (
-        bullish_htf
+        bullish_event
         and sweep_sell_ok
         and zone_match_long is not None
         and effective_ote_range is not None
         and golden_direction >= 0
         and price_value is not None
     ):
-        reasons = [f"HTF {htf_tf} BOS صاعد مؤكد"]
+        event_key = bullish_key or "BOS"
+        reasons = [f"HTF {htf_tf} {event_key} صاعد مؤكد"]
         if sweep_sell is not None:
             reasons.append("LTF 1m سحب سيولة بيعي (sell-side sweep)")
         reasons.append("السعر داخل منطقة طلب/FVG صاعدة ضمن نطاق OTE")
         metadata = {
-            "htf_event": {"key": "BOS", **bullish_htf},
+            "htf_event": {"key": event_key, **bullish_event},
             "ltf_sweep": sweep_sell,
             "zone": {"source": zone_source_long, **zone_match_long},
             "golden_direction": golden_direction,
@@ -9016,6 +9164,7 @@ def scan_binance(
             )
             continue
         daily_change = _extract_daily_change_percent(ticker)
+        performance_metric = _extract_performance_metric(ticker, ICT_PERFORMANCE_SETTINGS)
         if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
             print(
                 f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
@@ -9049,6 +9198,7 @@ def scan_binance(
 
         metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
         metrics["daily_change_percent"] = daily_change
+        metrics["performance_metric_value"] = performance_metric
         summaries.append(
             {
                 "symbol": symbol,
@@ -9058,6 +9208,7 @@ def scan_binance(
                 "boxes": metrics.get("boxes", len(runtime.boxes)),
                 "metrics": metrics,
                 "matches": metrics["ict_strategy_matches"],
+                "metric_value": performance_metric,
             }
         )
         matches_found += 1
@@ -9075,6 +9226,8 @@ def scan_binance(
             primary_runtime = runtime
     if matches_found == 0:
         print("لم يتم العثور على عملات تطابق استراتيجية ICT في الوقت الحالي.", flush=True)
+    else:
+        print_performance_rankings(summaries, ICT_PERFORMANCE_SETTINGS)
 
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
