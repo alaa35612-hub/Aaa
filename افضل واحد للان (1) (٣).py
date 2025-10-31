@@ -1292,6 +1292,7 @@ class SmartMoneyAlgoProE5:
     PDH_TEXT = "PDH"
     PDL_TEXT = "PDL"
     MID_TEXT = "0.5"
+    CHOCH_CORRECTION_ALERT_TITLE = "CHOCH Correction Alert"
 
     def __init__(
         self,
@@ -1333,6 +1334,13 @@ class SmartMoneyAlgoProE5:
         self.swing_state = SwingStateMirror()
         self.order_block_state = OrderBlockStateMirror()
         self.scob_state = SCOBStateMirror()
+
+        # Alert orchestration -------------------------------------------------
+        self.last_choch_event: Optional[Dict[str, Any]] = None
+        self._last_choch_alert_time: Optional[int] = None
+        self._forced_alert_timestamp: Optional[int] = None
+        self._golden_zone_touch_state: Optional[str] = None
+        self._golden_zone_last_touch_time: Optional[int] = None
 
         # Pine condition mirroring -------------------------------------------
         self.condition_specs: Dict[str, ConditionSpec] = {}
@@ -1414,17 +1422,27 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if condition:
-            timestamp = self.series.get_time(0)
-            text = title if message is None else f"{title} :: {message}"
-            self.alerts.append((timestamp, text))
-            self._trace(
-                "alertcondition",
-                "trigger",
-                timestamp=timestamp,
-                title=title,
-                alert_message=message,
-            )
+        if not condition:
+            self._forced_alert_timestamp = None
+            return
+        if title != self.CHOCH_CORRECTION_ALERT_TITLE:
+            self._forced_alert_timestamp = None
+            return
+        timestamp = (
+            self._forced_alert_timestamp
+            if isinstance(self._forced_alert_timestamp, int)
+            else self.series.get_time(0)
+        )
+        text = title if message is None else f"{title} :: {message}"
+        self.alerts.append((timestamp, text))
+        self._trace(
+            "alertcondition",
+            "trigger",
+            timestamp=timestamp,
+            title=title,
+            alert_message=message,
+        )
+        self._forced_alert_timestamp = None
 
     def _eval_condition(
         self,
@@ -1590,7 +1608,7 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
-        self.console_event_log[key] = {
+        record = {
             "text": key,
             "price": price,
             "time": timestamp,
@@ -1600,6 +1618,10 @@ class SmartMoneyAlgoProE5:
             "direction_display": direction_text,
             "source": "confirmed",
         }
+        self.console_event_log[key] = record
+        if key == "CHOCH":
+            self.last_choch_event = record
+            self._last_choch_alert_time = None
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -1620,6 +1642,18 @@ class SmartMoneyAlgoProE5:
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
+            if key == "GOLDEN_ZONE":
+                if status_key == "new":
+                    self._golden_zone_touch_state = "new"
+                    self._golden_zone_last_touch_time = None
+                elif status_key == "archived":
+                    self._golden_zone_touch_state = None
+                    self._golden_zone_last_touch_time = None
+                elif status_key in {"touched", "retest"}:
+                    self._golden_zone_touch_state = "touched"
+                    self._golden_zone_last_touch_time = ts
+            if status_key in {"touched", "retest"}:
+                self._handle_zone_correction_alert(key, ts)
             self.console_event_log[key] = {
                 "text": box.text,
                 "price": (box.bottom, box.top),
@@ -1639,6 +1673,37 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
+
+    def _handle_zone_correction_alert(self, zone_key: str, event_time: int) -> None:
+        if zone_key not in {"IDM_OB", "EXT_OB", "GOLDEN_ZONE"}:
+            return
+        if not self.last_choch_event:
+            return
+        choch_time = self.last_choch_event.get("time")
+        if not isinstance(choch_time, int):
+            return
+        if event_time <= choch_time:
+            return
+        if self._last_choch_alert_time == choch_time:
+            return
+        zone_names = {
+            "IDM_OB": "IDM OB",
+            "EXT_OB": "EXT OB",
+            "GOLDEN_ZONE": "Golden zone",
+        }
+        direction_display = self.last_choch_event.get("direction_display")
+        choch_price = self.last_choch_event.get("price")
+        message_parts = ["تم التصحيح إلى منطقة", zone_names.get(zone_key, zone_key), "بعد CHOCH"]
+        if isinstance(direction_display, str) and direction_display:
+            message_parts.append(direction_display)
+        if isinstance(choch_price, (int, float)):
+            price_value = float(choch_price)
+            if not math.isnan(price_value):
+                message_parts.append(f"عند {format_price(price_value)}")
+        message = " ".join(message_parts)
+        self._forced_alert_timestamp = event_time
+        self.alertcondition(True, self.CHOCH_CORRECTION_ALERT_TITLE, message)
+        self._last_choch_alert_time = choch_time
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -7197,6 +7262,8 @@ class SmartMoneyAlgoProE5:
             ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
             if oi1 is not None:
                 if self.bxf and self.bxf in self.boxes:
+                    self._golden_zone_touch_state = None
+                    self._golden_zone_last_touch_time = None
                     self.boxes.remove(self.bxf)
                 top_val = ot if not math.isnan(ot) else self.series.get("high")
                 bot_val = ob if not math.isnan(ob) else self.series.get("low")
@@ -7206,6 +7273,16 @@ class SmartMoneyAlgoProE5:
                 self._register_box_event(self.bxf, status="new")
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
+
+        if isinstance(self.bxf, Box):
+            zone_top = max(self.bxf.top, self.bxf.bottom)
+            zone_bottom = min(self.bxf.top, self.bxf.bottom)
+            high = self.series.get("high")
+            low = self.series.get("low")
+            if high >= zone_bottom and low <= zone_top:
+                if self._golden_zone_last_touch_time != time_val:
+                    status = "touched" if self._golden_zone_touch_state != "touched" else "retest"
+                    self._register_box_event(self.bxf, status=status, event_time=time_val)
 
         self._sync_state_mirrors()
 
