@@ -166,6 +166,11 @@ KILLZONES_NY: Dict[str, Tuple[datetime.time, datetime.time]] = {
     "ny_pm": (datetime.time(14, 0), datetime.time(15, 0)),
 }
 
+try:
+    _NY_TIMEZONE = ZoneInfo("America/New_York") if ZoneInfo is not None else None
+except Exception:  # pragma: no cover - optional dependency
+    _NY_TIMEZONE = None
+
 ICT_RULES: Dict[str, Any] = {
     "bias": {
         "long": {"need": ["htf_bullish_bias"]},
@@ -199,9 +204,12 @@ def in_killzone_now(now_utc: Optional[datetime.datetime] = None) -> bool:
     if not ICT_SETTINGS.get("use_killzones", True):
         return True
     now_utc = now_utc or datetime.datetime.utcnow()
-    if ZoneInfo is None:
+    if ZoneInfo is None or _NY_TIMEZONE is None:
         return True
-    ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    try:
+        ny = now_utc.astimezone(_NY_TIMEZONE)
+    except Exception:
+        return True
     now_time = ny.time()
     for name, (start, end) in KILLZONES_NY.items():
         if name.startswith("silver") and not ICT_SETTINGS.get("use_silver_bullet", True):
@@ -8939,14 +8947,15 @@ def print_performance_rankings(
 
     metric_name = settings.metric_name or "metric"
     metric_name = metric_name.strip() or "metric"
-    header = f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric_name}'"
-    print(header, flush=True)
     threshold = settings.minimum_value
+    header = f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric_name}'"
     if threshold is not None:
         try:
-            print(f"{metric_name}: {float(threshold):.2f}", flush=True)
+            threshold_text = f"{float(threshold):.2f}"
         except (TypeError, ValueError):
-            print(f"{metric_name}: {threshold}", flush=True)
+            threshold_text = str(threshold)
+        header = f"{header} وحد أدنى {threshold_text}"
+    print(header, flush=True)
 
     candidates: List[Tuple[float, Dict[str, Any]]] = []
     for summary in summaries:
