@@ -22,6 +22,7 @@ parity against the Pine logic.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import bisect
 import copy
 import dataclasses
@@ -37,12 +38,17 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 try:
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     ccxt = None  # type: ignore
+
+try:
+    import ccxt.async_support as ccxt_async  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    ccxt_async = None  # type: ignore
 
 try:
     import requests  # type: ignore
@@ -1196,6 +1202,39 @@ class Box:
 
     def get_right(self) -> int:
         return self.right
+
+
+@dataclass
+class CustomPoint:
+    """Pivot point used when building support/resistance clusters."""
+
+    time: int
+    price: float
+    tr: float
+
+
+@dataclass
+class SupportResistanceLevel:
+    """Tracks the lifecycle of an individual support/resistance level."""
+
+    rs_type: str
+    timeframe: str
+    price: float
+    points: List[CustomPoint] = field(default_factory=list)
+    line: Optional[Line] = None
+    box: Optional[Box] = None
+    price_label: Optional[Label] = None
+    break_label: Optional[Label] = None
+    break_box: Optional[Box] = None
+    retest_labels: List[Label] = field(default_factory=list)
+    is_broken: bool = False
+    broken_time: Optional[int] = None
+    break_level: Optional[float] = None
+    break_tr: float = 0.0
+    last_break_alert_time: Optional[int] = None
+    last_retest_alert_time: Optional[int] = None
+    last_retest_time: Optional[int] = None
+    last_retest_bar: Optional[int] = None
 
 
 @dataclass
@@ -7626,6 +7665,117 @@ def _binance_pick_symbols(
     return final, prioritized_symbols
 
 
+async def _binance_pick_symbols_async(
+    exchange: Any,
+    limit: int,
+    explicit: Optional[str],
+    selector: BinanceSymbolSelectorConfig,
+) -> Tuple[List[str], List[str]]:
+    if explicit:
+        requested = [symbol.strip().upper() for symbol in explicit.split(",") if symbol.strip()]
+        try:
+            markets = await exchange.load_markets()
+        except Exception as exc:
+            print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
+            return [], []
+        valid = [symbol for symbol in requested if symbol in markets]
+        invalid = sorted(set(requested) - set(valid))
+        if invalid:
+            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid)}")
+        return valid, []
+
+    try:
+        markets = await exchange.load_markets()
+    except Exception as exc:
+        print(f"فشل تحميل أسواق Binance: {exc}")
+        return [], []
+
+    usdtm_markets: List[Dict[str, Any]] = [
+        market
+        for market in markets.values()
+        if market.get("linear")
+        and market.get("quote") == "USDT"
+        and market.get("type") == "swap"
+        and market.get("active")
+    ]
+    if not usdtm_markets:
+        print("لم يتم العثور على عقود Binance USDT-M نشطة.")
+        return [], []
+
+    try:
+        tickers = await exchange.fetch_tickers()
+    except Exception as exc:
+        print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
+        tickers = {}
+
+    symbol_set = {
+        market.get("symbol")
+        for market in usdtm_markets
+        if isinstance(market.get("symbol"), str)
+    }
+    tickers = {symbol: tickers.get(symbol, {}) for symbol in symbol_set}
+
+    prioritized: List[Tuple[str, float, float]] = []
+    try:
+        threshold = float(selector.top_gainer_threshold)
+    except (TypeError, ValueError):
+        threshold = 0.0
+    metric = selector.top_gainer_metric
+
+    if selector.prioritize_top_gainers and tickers:
+        print(
+            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f}.",
+            flush=True,
+        )
+        for market in usdtm_markets:
+            symbol = market.get("symbol")
+            if not isinstance(symbol, str):
+                continue
+            metric_value = _ticker_metric_value(tickers.get(symbol, {}), metric)
+            if metric_value is None or metric_value < threshold:
+                continue
+            volume = _extract_quote_volume(tickers.get(symbol, {})) or 0.0
+            prioritized.append((symbol, metric_value, volume))
+        prioritized.sort(key=lambda item: (item[1], item[2]), reverse=True)
+
+    def volume_key(market_data: Dict[str, Any]) -> float:
+        symbol = market_data.get("symbol")
+        if not symbol:
+            return 0.0
+        vol = _extract_quote_volume(tickers.get(symbol, {}))
+        if vol is not None:
+            return vol
+        base_vol = tickers.get(symbol, {}).get("baseVolume")
+        try:
+            return float(base_vol) if base_vol is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    usdtm_by_volume = sorted(usdtm_markets, key=volume_key, reverse=True)
+
+    target_limit = limit if limit and limit > 0 else len(usdtm_by_volume)
+    final: List[str] = []
+    added: set[str] = set()
+
+    for symbol, _, _ in prioritized:
+        if len(final) >= target_limit:
+            break
+        if symbol not in added:
+            final.append(symbol)
+            added.add(symbol)
+
+    for market in usdtm_by_volume:
+        if len(final) >= target_limit:
+            break
+        symbol = market.get("symbol")
+        if symbol and symbol not in added:
+            final.append(symbol)
+            added.add(symbol)
+
+    prioritized_symbols = [symbol for symbol, _, _ in prioritized if symbol in added]
+    return final, prioritized_symbols
+
+
 def fetch_binance_usdtm_symbols(
     exchange: Any,
     *,
@@ -7646,6 +7796,32 @@ def fetch_binance_usdtm_symbols(
         symbol
         for symbol, market in markets.items()
         if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap"
+    ]
+    symbols.sort()
+    if limit and limit > 0:
+        return symbols[:limit]
+    return symbols
+
+
+async def fetch_binance_usdtm_symbols_async(
+    exchange: Any,
+    *,
+    limit: Optional[int] = None,
+    explicit: Optional[str] = None,
+    selector: Optional[BinanceSymbolSelectorConfig] = None,
+) -> List[str]:
+    selector_cfg = selector or DEFAULT_BINANCE_SYMBOL_SELECTOR
+    final, _ = await _binance_pick_symbols_async(exchange, limit or 0, explicit, selector_cfg)
+    if final:
+        return final
+
+    markets = await exchange.load_markets()
+    symbols = [
+        symbol
+        for symbol, market in markets.items()
+        if market.get("linear")
+        and market.get("quote") == "USDT"
+        and market.get("type") == "swap"
     ]
     symbols.sort()
     if limit and limit > 0:
@@ -7682,6 +7858,53 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
             raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
         else:
             raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=request_limit, since=since)
+        if not raw:
+            break
+        for entry in raw:
+            candles.append(
+                {
+                    "time": entry[0],
+                    "open": entry[1],
+                    "high": entry[2],
+                    "low": entry[3],
+                    "close": entry[4],
+                    "volume": entry[5],
+                }
+            )
+        if target is not None and len(candles) > target:
+            candles = candles[-target:]
+        last_open = raw[-1][0]
+        next_since = last_open + timeframe_ms
+        if len(raw) < request_limit:
+            break
+        if next_since <= since:
+            next_since = since + timeframe_ms
+        since = next_since
+    return candles
+
+
+async def fetch_ohlcv_async(
+    exchange: Any, symbol: str, timeframe: str, limit: int
+) -> List[Dict[str, float]]:
+    timeframe_seconds = _parse_timeframe_to_seconds(timeframe, None) or 60
+    timeframe_ms = timeframe_seconds * 1000
+    max_batch = 1500
+    since = 0
+    candles: List[Dict[str, float]] = []
+    target = limit if limit > 0 else None
+
+    while True:
+        request_limit = max_batch
+        if target is not None and target < max_batch and not candles:
+            request_limit = target
+        if since <= 0:
+            raw = await exchange.fetch_ohlcv(
+                symbol, timeframe=timeframe, limit=request_limit, since=since
+            )
+        else:
+            raw = await exchange.fetch_ohlcv(
+                symbol, timeframe=timeframe, limit=request_limit, since=since
+            )
         if not raw:
             break
         for entry in raw:
@@ -8705,6 +8928,131 @@ def _collect_recent_event_hits(
 
 
 @dataclass
+class SymbolRuntimeContext:
+    runtime: SmartMoneyAlgoProE5
+    last_timestamp: Optional[int] = None
+
+    def ingest(self, candles: Sequence[Dict[str, float]]) -> Sequence[Dict[str, float]]:
+        if not candles:
+            return []
+        processed: List[Dict[str, float]] = []
+        latest_ts = self.last_timestamp
+        if not self.runtime.initialised:
+            self.runtime.process(candles)
+            processed = list(candles)
+            last = candles[-1].get("time")
+            if isinstance(last, (int, float)):
+                self.last_timestamp = int(last)
+            return processed
+        new_items: List[Dict[str, float]] = []
+        for candle in candles:
+            ts_raw = candle.get("time")
+            ts_val = int(ts_raw) if isinstance(ts_raw, (int, float)) else None
+            if latest_ts is None or (ts_val is not None and ts_val > latest_ts):
+                new_items.append(candle)
+        if new_items:
+            self.runtime.process(new_items)
+            processed = new_items
+            last = new_items[-1].get("time")
+            if isinstance(last, (int, float)):
+                self.last_timestamp = int(last)
+        elif latest_ts is None:
+            last = candles[-1].get("time")
+            if isinstance(last, (int, float)):
+                self.last_timestamp = int(last)
+        return processed
+
+
+def _collect_immediate_events(runtime: SmartMoneyAlgoProE5) -> Dict[str, Dict[str, Any]]:
+    events: Dict[str, Dict[str, Any]] = {}
+    event_log = getattr(runtime, "console_event_log", None)
+    if not isinstance(event_log, dict):
+        return events
+    for key, payload in event_log.items():
+        if isinstance(payload, dict):
+            events[key] = payload.copy()
+    return events
+
+
+class ImmediateEventCache:
+    def __init__(self) -> None:
+        self._seen: Dict[Tuple[str, str], Tuple[int, str, str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def filter_new(
+        self, symbol: str, events: Dict[str, Dict[str, Any]]
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        if not events:
+            return []
+        new_events: List[Tuple[str, Dict[str, Any]]] = []
+        async with self._lock:
+            for key, payload in events.items():
+                if not isinstance(payload, dict):
+                    continue
+                timestamp_raw = payload.get("time") or payload.get("timestamp")
+                timestamp = int(timestamp_raw) if isinstance(timestamp_raw, (int, float)) else 0
+                status = str(payload.get("status", ""))
+                display = str(payload.get("display", payload.get("text", "")))
+                fingerprint = (timestamp, status, display)
+                cache_key = (symbol, str(key))
+                if self._seen.get(cache_key) == fingerprint:
+                    continue
+                self._seen[cache_key] = fingerprint
+                new_events.append((str(key), payload))
+        return new_events
+
+
+class AlertDispatcher:
+    def __init__(
+        self,
+        print_lock: asyncio.Lock,
+        *,
+        sink: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._queue: asyncio.Queue[
+            Tuple[Optional[str], Optional[Dict[str, Dict[str, Any]]]]
+        ] = asyncio.Queue()
+        self._print_lock = print_lock
+        self._sink = sink or (lambda message: print(message, flush=True))
+        self._task: Optional[asyncio.Task[None]] = None
+        self._cache = ImmediateEventCache()
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._worker())
+
+    async def publish(self, symbol: str, events: Dict[str, Dict[str, Any]]) -> None:
+        await self._queue.put((symbol, events))
+
+    async def close(self) -> None:
+        await self._queue.put((None, None))
+        await self._queue.join()
+        if self._task is not None:
+            await self._task
+
+    async def _worker(self) -> None:
+        while True:
+            symbol, events = await self._queue.get()
+            try:
+                if symbol is None:
+                    break
+                new_events = await self._cache.filter_new(symbol, events or {})
+                for key, payload in new_events:
+                    await self._emit(symbol, key, payload)
+            finally:
+                self._queue.task_done()
+
+    async def _emit(self, symbol: str, key: str, payload: Dict[str, Any]) -> None:
+        timestamp_raw = payload.get("time") or payload.get("timestamp")
+        timestamp = int(timestamp_raw) if isinstance(timestamp_raw, (int, float)) else None
+        ts_display = format_timestamp(timestamp) if timestamp else "—"
+        display = payload.get("display") or payload.get("text") or payload.get("title") or key
+        status = payload.get("status_display") or payload.get("status")
+        status_segment = f" ({status})" if status else ""
+        line = f"[{ts_display}] {_format_symbol(symbol)} — {key}{status_segment}: {display}"
+        async with self._print_lock:
+            self._sink(line)
+@dataclass
 class ICTStrategyMatch:
     direction: str
     setup: str
@@ -8815,6 +9163,63 @@ def _extract_golden_zone(runtime: Any) -> Tuple[Optional[Tuple[float, float]], i
     return None, direction
 
 
+class BinanceUSDMAsyncSession:
+    def __init__(self, exchange: Any, concurrency: int) -> None:
+        self.exchange = exchange
+        self._semaphore = asyncio.Semaphore(max(1, concurrency))
+        self._markets_lock = asyncio.Lock()
+
+    @classmethod
+    async def create(
+        cls,
+        concurrency: int,
+        exchange_factory: Optional[Callable[[], Union[Any, Awaitable[Any]]]] = None,
+    ) -> "BinanceUSDMAsyncSession":
+        if exchange_factory is not None:
+            exchange_candidate = exchange_factory()
+            if inspect.isawaitable(exchange_candidate):
+                exchange = await exchange_candidate
+            else:
+                exchange = exchange_candidate
+        else:
+            if ccxt_async is None:
+                raise RuntimeError("ccxt.async_support is not available")
+            exchange = ccxt_async.binanceusdm({"enableRateLimit": True})
+        return cls(exchange, concurrency)
+
+    async def close(self) -> None:
+        closer = getattr(self.exchange, "close", None)
+        if callable(closer):
+            try:
+                await closer()
+            except Exception:
+                pass
+
+    async def fetch_ticker(self, symbol: str) -> Dict[str, Any]:
+        async with self._semaphore:
+            return await self.exchange.fetch_ticker(symbol)
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, float]]:
+        async with self._semaphore:
+            return await fetch_ohlcv_async(self.exchange, symbol, timeframe, limit)
+
+    async def fetch_symbols(
+        self,
+        *,
+        limit: Optional[int] = None,
+        explicit: Optional[str] = None,
+        selector: Optional[BinanceSymbolSelectorConfig] = None,
+    ) -> List[str]:
+        async with self._markets_lock:
+            async with self._semaphore:
+                return await fetch_binance_usdtm_symbols_async(
+                    self.exchange,
+                    limit=limit,
+                    explicit=explicit,
+                    selector=selector,
+                )
+
+
 def detect_ict_strategy(
     exchange: Any,
     symbol: str,
@@ -8823,7 +9228,6 @@ def detect_ict_strategy(
     *,
     config: Dict[str, Any] = ICT_STRATEGY_RULES,
 ) -> List[ICTStrategyMatch]:
-    matches: List[ICTStrategyMatch] = []
     runtime_cfg = config.get("runtime", {})
     htf_tf = runtime_cfg.get("htf_timeframe", "15m")
     ltf_tf = runtime_cfg.get("ltf_timeframe", "1m")
@@ -8839,32 +9243,55 @@ def detect_ict_strategy(
             file=sys.stderr,
             flush=True,
         )
-        return matches
+        return []
 
     try:
-        runtime_htf = SmartMoneyAlgoProE5(
-            inputs=_clone_indicator_inputs(base_inputs),
-            base_timeframe=htf_tf,
-            tracer=tracer,
+        return _detect_ict_strategy_from_candles(
+            symbol,
+            base_inputs,
+            tracer,
+            config,
+            htf_tf,
+            ltf_tf,
+            htf_candles,
+            ltf_candles,
         )
-        runtime_htf.process(htf_candles)
-        metrics_htf = runtime_htf.gather_console_metrics()
-
-        runtime_ltf = SmartMoneyAlgoProE5(
-            inputs=_clone_indicator_inputs(base_inputs),
-            base_timeframe=ltf_tf,
-            tracer=tracer,
-        )
-        runtime_ltf.process(ltf_candles)
-        metrics_ltf = runtime_ltf.gather_console_metrics()
     except Exception as exc:
         print(
             f"تخطي {_format_symbol(symbol)} (فشل تقييم الاستراتيجية): {exc}",
             file=sys.stderr,
             flush=True,
         )
-        return matches
+        return []
 
+
+def _detect_ict_strategy_from_candles(
+    symbol: str,
+    base_inputs: IndicatorInputs,
+    tracer: Optional[ExecutionTracer],
+    config: Dict[str, Any],
+    htf_tf: str,
+    ltf_tf: str,
+    htf_candles: Sequence[Dict[str, float]],
+    ltf_candles: Sequence[Dict[str, float]],
+) -> List[ICTStrategyMatch]:
+    runtime_htf = SmartMoneyAlgoProE5(
+        inputs=_clone_indicator_inputs(base_inputs),
+        base_timeframe=htf_tf,
+        tracer=tracer,
+    )
+    runtime_htf.process(htf_candles)
+    metrics_htf = runtime_htf.gather_console_metrics()
+
+    runtime_ltf = SmartMoneyAlgoProE5(
+        inputs=_clone_indicator_inputs(base_inputs),
+        base_timeframe=ltf_tf,
+        tracer=tracer,
+    )
+    runtime_ltf.process(ltf_candles)
+    metrics_ltf = runtime_ltf.gather_console_metrics()
+
+    matches: List[ICTStrategyMatch] = []
     htf_events = metrics_htf.get("latest_events") or {}
     ltf_events = metrics_ltf.get("latest_events") or {}
 
@@ -8892,9 +9319,12 @@ def detect_ict_strategy(
     bullish_fvg_boxes = _collect_fvg_boxes(runtime_ltf, True)
     bearish_fvg_boxes = _collect_fvg_boxes(runtime_ltf, False)
 
-    # Long setup ------------------------------------------------------------
     bos_event = htf_events.get("BOS") if isinstance(htf_events, dict) else None
-    bullish_htf = bos_event if isinstance(bos_event, dict) and bos_event.get("direction") == "bullish" else None
+    bullish_htf = (
+        bos_event
+        if isinstance(bos_event, dict) and bos_event.get("direction") == "bullish"
+        else None
+    )
     sweep_sell = (
         sweep_event
         if isinstance(sweep_event, dict) and sweep_event.get("liquidity_side") == "sell-side"
@@ -8939,7 +9369,6 @@ def detect_ict_strategy(
             )
         )
 
-    # Short setup -----------------------------------------------------------
     bearish_event: Optional[Dict[str, Any]] = None
     bearish_key = None
     for candidate in ("BOS", "CHOCH"):
@@ -8996,6 +9425,271 @@ def detect_ict_strategy(
     return matches
 
 
+async def detect_ict_strategy_async(
+    fetcher: Callable[[str, str, int], Awaitable[Sequence[Dict[str, float]]]],
+    symbol: str,
+    base_inputs: IndicatorInputs,
+    tracer: Optional[ExecutionTracer] = None,
+    *,
+    config: Dict[str, Any] = ICT_STRATEGY_RULES,
+) -> List[ICTStrategyMatch]:
+    runtime_cfg = config.get("runtime", {})
+    htf_tf = runtime_cfg.get("htf_timeframe", "15m")
+    ltf_tf = runtime_cfg.get("ltf_timeframe", "1m")
+    htf_limit = int(runtime_cfg.get("htf_lookback", 400) or 400)
+    ltf_limit = int(runtime_cfg.get("ltf_lookback", 1200) or 1200)
+
+    try:
+        htf_candles = await fetcher(symbol, htf_tf, htf_limit)
+        ltf_candles = await fetcher(symbol, ltf_tf, ltf_limit)
+    except Exception as exc:
+        print(
+            f"تخطي {_format_symbol(symbol)} (فشل تحميل بيانات الاستراتيجية): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+
+    try:
+        return _detect_ict_strategy_from_candles(
+            symbol,
+            base_inputs,
+            tracer,
+            config,
+            htf_tf,
+            ltf_tf,
+            htf_candles,
+            ltf_candles,
+        )
+    except Exception as exc:
+        print(
+            f"تخطي {_format_symbol(symbol)} (فشل تقييم الاستراتيجية): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+
+
+
+async def scan_binance_async(
+    timeframe: str,
+    limit: int,
+    symbols: Optional[List[str]],
+    concurrency: int,
+    tracer: Optional[ExecutionTracer] = None,
+    *,
+    min_daily_change: float = 0.0,
+    inputs: Optional[IndicatorInputs] = None,
+    recent_window_bars: Optional[int] = None,
+    max_symbols: Optional[int] = None,
+    symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    exchange_factory: Optional[Callable[[], Union[Any, Awaitable[Any]]]] = None,
+) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+    if ccxt_async is None and exchange_factory is None:
+        raise RuntimeError("ccxt.async_support is not available")
+
+    if inputs is None:
+        runtime_inputs = IndicatorInputs()
+    else:
+        runtime_inputs = copy.deepcopy(inputs)
+    runtime_inputs.fvg.show_fvg = True
+    runtime_inputs.structure_util.isOTE = True
+    runtime_inputs.structure_util.markX = True
+    runtime_inputs.structure_util.showSw = True
+
+    session = await BinanceUSDMAsyncSession.create(
+        max(1, concurrency), exchange_factory=exchange_factory
+    )
+    try:
+        if symbols:
+            all_symbols = list(symbols)
+        else:
+            all_symbols = await session.fetch_symbols(
+                limit=max_symbols, selector=symbol_selector
+            )
+        if max_symbols and max_symbols > 0 and not symbols:
+            all_symbols = all_symbols[: int(max_symbols)]
+
+        summaries: List[Dict[str, Any]] = []
+        primary_runtime: Optional[SmartMoneyAlgoProE5] = None
+
+        window = recent_window_bars
+        if window is None:
+            console_inputs = getattr(runtime_inputs, "console", None)
+            if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
+                try:
+                    window = int(console_inputs.max_age_bars) + 1
+                except Exception:
+                    window = 2
+            else:
+                window = 2
+        window = max(1, int(window))
+
+        if not all_symbols:
+            primary_runtime = SmartMoneyAlgoProE5(
+                inputs=_clone_indicator_inputs(runtime_inputs),
+                base_timeframe=timeframe,
+                tracer=tracer,
+            )
+            primary_runtime.process([])
+            return primary_runtime, summaries
+
+        print_lock = asyncio.Lock()
+        tracer_lock = asyncio.Lock()
+        dispatcher = AlertDispatcher(print_lock)
+        await dispatcher.start()
+
+        runtime_cache: Dict[str, SymbolRuntimeContext] = {}
+
+        async def process_symbol(
+            idx: int, symbol: str
+        ) -> Tuple[int, Optional[Dict[str, Any]], Optional[SmartMoneyAlgoProE5]]:
+            try:
+                ticker = await session.fetch_ticker(symbol)
+            except Exception as exc:
+                async with print_lock:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                return idx, None, None
+
+            daily_change = _extract_daily_change_percent(ticker)
+            if (
+                min_daily_change > 0.0
+                and daily_change is not None
+                and daily_change <= min_daily_change
+            ):
+                async with print_lock:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                        flush=True,
+                    )
+                if tracer and tracer.enabled:
+                    async with tracer_lock:
+                        tracer.log(
+                            "scan",
+                            "symbol_skipped_daily_change",
+                            timestamp=None,
+                            symbol=symbol,
+                            change=daily_change,
+                            threshold=min_daily_change,
+                        )
+                return idx, None, None
+
+            try:
+                candles = await session.fetch_ohlcv(symbol, timeframe, limit)
+            except Exception as exc:
+                async with print_lock:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ohlcv: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                return idx, None, None
+
+            context = runtime_cache.get(symbol)
+            if context is None:
+                runtime = SmartMoneyAlgoProE5(
+                    inputs=_clone_indicator_inputs(runtime_inputs),
+                    base_timeframe=timeframe,
+                    tracer=tracer,
+                )
+                context = SymbolRuntimeContext(runtime)
+                runtime_cache[symbol] = context
+            processed = context.ingest(candles)
+            runtime = context.runtime
+
+            metrics = runtime.gather_console_metrics()
+            latest_events = metrics.get("latest_events") or {}
+            strategy_matches = await detect_ict_strategy_async(
+                lambda sym, tf, lim: session.fetch_ohlcv(sym, tf, lim),
+                symbol,
+                runtime_inputs,
+                tracer,
+            )
+            if strategy_matches:
+                metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
+            recent_hits, recent_times = _collect_recent_event_hits(
+                runtime.series, latest_events, bars=window
+            )
+            if not recent_hits and not strategy_matches:
+                async with print_lock:
+                    print(
+                        f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
+                        flush=True,
+                    )
+                if tracer and tracer.enabled:
+                    async with tracer_lock:
+                        tracer.log(
+                            "scan",
+                            "symbol_skipped_stale_events",
+                            timestamp=runtime.series.get_time(0) or None,
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            reference_times=recent_times,
+                            window=window,
+                        )
+                return idx, None, None
+
+            metrics["daily_change_percent"] = daily_change
+            summary = {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "candles": len(candles),
+                "alerts": metrics.get("alerts", len(runtime.alerts)),
+                "boxes": metrics.get("boxes", len(runtime.boxes)),
+                "metrics": metrics,
+            }
+
+            async with print_lock:
+                print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+            if tracer and tracer.enabled:
+                async with tracer_lock:
+                    tracer.log(
+                        "scan",
+                        "symbol_complete",
+                        timestamp=runtime.series.get_time(0),
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        candles=len(candles),
+                    )
+
+            if processed:
+                events = _collect_immediate_events(runtime)
+                await dispatcher.publish(symbol, events)
+
+            return idx, summary, runtime
+
+        try:
+            tasks = [
+                asyncio.create_task(process_symbol(idx, symbol))
+                for idx, symbol in enumerate(all_symbols)
+            ]
+            results = await asyncio.gather(*tasks)
+        finally:
+            await dispatcher.close()
+
+        ordered = sorted(results, key=lambda item: item[0])
+        for _, summary, runtime in ordered:
+            if summary:
+                summaries.append(summary)
+                if primary_runtime is None and runtime is not None:
+                    primary_runtime = runtime
+
+        if primary_runtime is None:
+            primary_runtime = SmartMoneyAlgoProE5(
+                inputs=_clone_indicator_inputs(runtime_inputs),
+                base_timeframe=timeframe,
+                tracer=tracer,
+            )
+            primary_runtime.process([])
+        return primary_runtime, summaries
+    finally:
+        await session.close()
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -9008,119 +9702,29 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    exchange_factory: Optional[Callable[[], Union[Any, Awaitable[Any]]]] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
-    if ccxt is None:
-        raise RuntimeError("ccxt is not available")
-    exchange = ccxt.binanceusdm({"enableRateLimit": True})
-    if inputs is None:
-        inputs = IndicatorInputs()
-    else:
-        inputs = copy.deepcopy(inputs)
-    inputs.fvg.show_fvg = True
-    inputs.structure_util.isOTE = True
-    inputs.structure_util.markX = True
-    inputs.structure_util.showSw = True
-    all_symbols = symbols or fetch_binance_usdtm_symbols(
-        exchange,
-        limit=max_symbols,
-        selector=symbol_selector,
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop and loop.is_running():
+        raise RuntimeError("scan_binance cannot be called from an active event loop; use scan_binance_async instead")
+    return asyncio.run(
+        scan_binance_async(
+            timeframe,
+            limit,
+            symbols,
+            concurrency,
+            tracer,
+            min_daily_change=min_daily_change,
+            inputs=inputs,
+            recent_window_bars=recent_window_bars,
+            max_symbols=max_symbols,
+            symbol_selector=symbol_selector,
+            exchange_factory=exchange_factory,
+        )
     )
-    if max_symbols and max_symbols > 0:
-        all_symbols = all_symbols[: int(max_symbols)]
-    summaries: List[Dict[str, Any]] = []
-    primary_runtime: Optional[SmartMoneyAlgoProE5] = None
-    window = recent_window_bars
-    if window is None:
-        console_inputs = getattr(inputs, "console", None) if inputs else None
-        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
-            try:
-                window = int(console_inputs.max_age_bars) + 1
-            except Exception:
-                window = 2
-        else:
-            window = 2
-    window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-        except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-        daily_change = _extract_daily_change_percent(ticker)
-        if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
-            print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_daily_change",
-                    timestamp=None,
-                    symbol=symbol,
-                    change=daily_change,
-                    threshold=min_daily_change,
-                )
-            continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-        runtime.process(candles)
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        strategy_matches = detect_ict_strategy(exchange, symbol, inputs, tracer)
-        if strategy_matches:
-            metrics["ict_strategy_matches"] = [match.as_dict() for match in strategy_matches]
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits and not strategy_matches:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
-                )
-            continue
-
-        metrics["daily_change_percent"] = daily_change
-        summaries.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(runtime.alerts)),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
-                "metrics": metrics,
-            }
-        )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-        if tracer and tracer.enabled:
-            tracer.log(
-                "scan",
-                "symbol_complete",
-                timestamp=runtime.series.get_time(0),
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
-            )
-        if primary_runtime is None:
-            primary_runtime = runtime
-    if primary_runtime is None:
-        primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
-        primary_runtime.process([])
-    return primary_runtime, summaries
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
