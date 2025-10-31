@@ -347,6 +347,17 @@ class ConsoleInputs:
 
 
 @dataclass
+class AlertLogicInputs:
+    """Centralised switches controlling the unified alert workflow."""
+
+    enable_all_alerts: bool = True
+    enable_choch_correction_alert: bool = True
+    enable_idm_ob_retest_alert: bool = True
+    enable_ext_ob_retest_alert: bool = True
+    enable_golden_zone_retest_alert: bool = True
+
+
+@dataclass
 class StructureInputs:
     isOTE: bool = False
     ote1: float = 0.78
@@ -523,6 +534,7 @@ class IndicatorInputs:
     order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
     candle: CandleInputs = field(default_factory=CandleInputs)
     console: ConsoleInputs = field(default_factory=ConsoleInputs)
+    alerts: AlertLogicInputs = field(default_factory=AlertLogicInputs)
     structure_util: StructureInputs = field(default_factory=StructureInputs)
     ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
     key_levels: KeyLevelsInputs = field(default_factory=KeyLevelsInputs)
@@ -1476,6 +1488,24 @@ class SmartMoneyAlgoProE5:
                 max_age = 0
         self.console_max_age_bars = max(0, max_age)
 
+        alert_inputs = getattr(self.inputs, "alerts", AlertLogicInputs())
+        if isinstance(alert_inputs, AlertLogicInputs):
+            self.alert_inputs = alert_inputs
+        else:
+            alert_kwargs: Dict[str, Any] = {}
+            if isinstance(alert_inputs, dict):
+                source_dict = alert_inputs
+            else:
+                source_dict = {}
+            for field in dataclasses.fields(AlertLogicInputs):
+                if isinstance(source_dict, dict) and field.name in source_dict:
+                    alert_kwargs[field.name] = source_dict[field.name]
+                else:
+                    value = getattr(alert_inputs, field.name, dataclasses.MISSING)
+                    if value is not dataclasses.MISSING:
+                        alert_kwargs[field.name] = value
+            self.alert_inputs = AlertLogicInputs(**alert_kwargs)
+
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
         self.market_structure_state = MarketStructureStateMirror()
@@ -1570,10 +1600,17 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
+        settings = getattr(self, "alert_inputs", AlertLogicInputs())
+        if not getattr(settings, "enable_all_alerts", True):
+            self._forced_alert_timestamp = None
+            return
         if not condition:
             self._forced_alert_timestamp = None
             return
         if title != self.CHOCH_CORRECTION_ALERT_TITLE:
+            self._forced_alert_timestamp = None
+            return
+        if not getattr(settings, "enable_choch_correction_alert", True):
             self._forced_alert_timestamp = None
             return
         timestamp = (
@@ -1823,6 +1860,11 @@ class SmartMoneyAlgoProE5:
             )
 
     def _handle_zone_correction_alert(self, zone_key: str, event_time: int) -> None:
+        settings = getattr(self, "alert_inputs", AlertLogicInputs())
+        if not getattr(settings, "enable_all_alerts", True):
+            return
+        if not getattr(settings, "enable_choch_correction_alert", True):
+            return
         if zone_key not in {"IDM_OB", "EXT_OB", "GOLDEN_ZONE"}:
             return
         if not self.last_choch_event:
@@ -1833,6 +1875,14 @@ class SmartMoneyAlgoProE5:
         if event_time <= choch_time:
             return
         if self._last_choch_alert_time == choch_time:
+            return
+        zone_flag_map = {
+            "IDM_OB": "enable_idm_ob_retest_alert",
+            "EXT_OB": "enable_ext_ob_retest_alert",
+            "GOLDEN_ZONE": "enable_golden_zone_retest_alert",
+        }
+        setting_name = zone_flag_map.get(zone_key)
+        if setting_name and not getattr(settings, setting_name, True):
             return
         zone_names = {
             "IDM_OB": "IDM OB",
