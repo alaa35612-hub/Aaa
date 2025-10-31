@@ -1630,6 +1630,57 @@ class SeriesAccessor:
 # ----------------------------------------------------------------------------
 
 
+def _normalise_candle(entry: Any) -> Optional[Dict[str, float]]:
+    """Convert raw OHLCV entries into the internal dictionary representation."""
+
+    if isinstance(entry, dict):
+        try:
+            time_val = int(float(entry["time"]))
+            open_val = float(entry["open"])
+            high_val = float(entry["high"])
+            low_val = float(entry["low"])
+            close_val = float(entry["close"])
+            volume_raw = entry.get("volume", NA)
+        except (KeyError, TypeError, ValueError):
+            return None
+        volume_val: float
+        try:
+            volume_val = float(volume_raw) if volume_raw is not None else NA
+        except (TypeError, ValueError):
+            volume_val = NA
+        return {
+            "time": time_val,
+            "open": open_val,
+            "high": high_val,
+            "low": low_val,
+            "close": close_val,
+            "volume": volume_val,
+        }
+
+    if isinstance(entry, (list, tuple)):
+        if len(entry) < 5:
+            return None
+        try:
+            time_val = int(float(entry[0]))
+            open_val = float(entry[1])
+            high_val = float(entry[2])
+            low_val = float(entry[3])
+            close_val = float(entry[4])
+            volume_val = float(entry[5]) if len(entry) > 5 and entry[5] is not None else NA
+        except (TypeError, ValueError):
+            return None
+        return {
+            "time": time_val,
+            "open": open_val,
+            "high": high_val,
+            "low": low_val,
+            "close": close_val,
+            "volume": volume_val,
+        }
+
+    return None
+
+
 def _parse_timeframe_to_seconds(timeframe: str, base_seconds: Optional[int]) -> Optional[int]:
     if timeframe == "" or timeframe is None:
         return base_seconds
@@ -2753,9 +2804,12 @@ class SmartMoneyAlgoProE5:
     # ------------------------------------------------------------------
     # Indicator execution
     # ------------------------------------------------------------------
-    def process(self, candles: Sequence[Dict[str, float]]) -> None:
+    def process(self, candles: Sequence[Any]) -> None:
         self.condition_trace.clear()
-        for candle in candles:
+        for entry in candles:
+            candle = _normalise_candle(entry)
+            if candle is None:
+                continue
             self.series.append(candle)
             self._trace(
                 "process",
