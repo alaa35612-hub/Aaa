@@ -1320,13 +1320,17 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = 1
+            max_age = 0
         else:
             try:
-                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
+                raw_value = getattr(console_inputs, "max_age_bars", 0)
+            except AttributeError:
+                raw_value = 0
+            try:
+                max_age = int(raw_value)
             except (TypeError, ValueError):
-                max_age = 1
-        self.console_max_age_bars = max(1, max_age)
+                max_age = 0
+        self.console_max_age_bars = max(0, max_age)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
