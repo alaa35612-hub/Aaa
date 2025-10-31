@@ -347,6 +347,27 @@ class ConsoleInputs:
 
 
 @dataclass
+class LogicToggleInputs:
+    """Master switches to enable or disable each logic package."""
+
+    enable_pullback: bool = True
+    enable_market_structure: bool = True
+    enable_order_block: bool = True
+    enable_demand_supply: bool = True
+    enable_fvg: bool = True
+    enable_liquidity: bool = True
+    enable_order_flow: bool = True
+    enable_candle_patterns: bool = True
+    enable_structure_util: bool = True
+    enable_ict_structure: bool = True
+    enable_key_levels: bool = True
+    enable_sessions: bool = True
+    enable_swing_detection: bool = True
+    enable_zigzag: bool = True
+    enable_support_resistance: bool = True
+
+
+@dataclass
 class AlertLogicInputs:
     """Centralised switches controlling the unified alert workflow."""
 
@@ -534,6 +555,7 @@ class IndicatorInputs:
     order_flow: OrderFlowInputs = field(default_factory=OrderFlowInputs)
     candle: CandleInputs = field(default_factory=CandleInputs)
     console: ConsoleInputs = field(default_factory=ConsoleInputs)
+    logic_toggles: LogicToggleInputs = field(default_factory=LogicToggleInputs)
     alerts: AlertLogicInputs = field(default_factory=AlertLogicInputs)
     structure_util: StructureInputs = field(default_factory=StructureInputs)
     ict_structure: ICTMarketStructureInputs = field(default_factory=ICTMarketStructureInputs)
@@ -1506,6 +1528,26 @@ class SmartMoneyAlgoProE5:
                         alert_kwargs[field.name] = value
             self.alert_inputs = AlertLogicInputs(**alert_kwargs)
 
+        logic_inputs = getattr(self.inputs, "logic_toggles", LogicToggleInputs())
+        if isinstance(logic_inputs, LogicToggleInputs):
+            self.logic_toggles = logic_inputs
+        else:
+            logic_kwargs: Dict[str, Any] = {}
+            if isinstance(logic_inputs, dict):
+                logic_source = logic_inputs
+            else:
+                logic_source = {}
+            for field in dataclasses.fields(LogicToggleInputs):
+                if isinstance(logic_source, dict) and field.name in logic_source:
+                    logic_kwargs[field.name] = logic_source[field.name]
+                else:
+                    value = getattr(logic_inputs, field.name, dataclasses.MISSING)
+                    if value is not dataclasses.MISSING:
+                        logic_kwargs[field.name] = value
+            self.logic_toggles = LogicToggleInputs(**logic_kwargs)
+
+        self._apply_logic_toggles()
+
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
         self.market_structure_state = MarketStructureStateMirror()
@@ -1536,6 +1578,105 @@ class SmartMoneyAlgoProE5:
         self.last_liq_low_time: Optional[int] = None
         self.bullish_OB_Break: bool = False
         self.bearish_OB_Break: bool = False
+
+    def _logic_enabled(self, flag: str) -> bool:
+        toggles = getattr(self, "logic_toggles", None)
+        if not isinstance(toggles, LogicToggleInputs):
+            return True
+        value = getattr(toggles, flag, True)
+        try:
+            return bool(value)
+        except Exception:
+            return True
+
+    def _apply_logic_toggles(self) -> None:
+        toggles = getattr(self, "logic_toggles", LogicToggleInputs())
+
+        def disable(obj: Any, name: str, value: Any = False) -> None:
+            if hasattr(obj, name):
+                setattr(obj, name, value)
+
+        if not toggles.enable_pullback:
+            disable(self.inputs.pullback, "showHL")
+            disable(self.inputs.pullback, "showMn")
+
+        if not toggles.enable_market_structure:
+            disable(self.inputs.structure, "showSMC")
+            disable(self.inputs.structure, "showCircleHL")
+
+        if not toggles.enable_order_block:
+            disable(self.inputs.order_block, "extndBox")
+            disable(self.inputs.order_block, "showExob")
+            disable(self.inputs.order_block, "showIdmob")
+            disable(self.inputs.order_block, "showBrkob")
+            disable(self.inputs.order_block, "showPOI")
+            disable(self.inputs.order_block, "showSCOB")
+
+        if not toggles.enable_demand_supply:
+            disable(self.inputs.demand_supply, "show_order_blocks")
+            disable(self.inputs.demand_supply, "show_order_blocks_mtf")
+
+        if not toggles.enable_fvg:
+            disable(self.inputs.fvg, "show_fvg")
+
+        if not toggles.enable_liquidity:
+            disable(self.inputs.liquidity, "currentTF")
+
+        if not toggles.enable_order_flow:
+            disable(self.inputs.order_flow, "showMajoinMiner")
+            disable(self.inputs.order_flow, "showISOB")
+            disable(self.inputs.order_flow, "showTsted")
+
+        if not toggles.enable_candle_patterns:
+            disable(self.inputs.candle, "showISB")
+            disable(self.inputs.candle, "showOSB")
+
+        if not toggles.enable_structure_util:
+            disable(self.inputs.structure_util, "showSw")
+            disable(self.inputs.structure_util, "showPdh")
+            disable(self.inputs.structure_util, "showPdl")
+            disable(self.inputs.structure_util, "showMid")
+            disable(self.inputs.structure_util, "isOTE")
+            disable(self.inputs.structure_util, "showTP")
+
+        if not toggles.enable_ict_structure:
+            disable(self.inputs.ict_structure, "showms")
+            disable(self.inputs.ict_structure, "show_equal_highlow")
+
+        if not toggles.enable_key_levels:
+            for attr in (
+                "Show_4H_Levels",
+                "Show_Daily_Levels",
+                "Show_Monday_Levels",
+                "Show_Weekly_Levels",
+                "Show_Monthly_Levels",
+                "Show_Quaterly_Levels",
+                "Show_Yearly_Levels",
+            ):
+                disable(self.inputs.key_levels, attr)
+
+        if not toggles.enable_sessions:
+            disable(self.inputs.sessions, "is_londonrange_enabled")
+            disable(self.inputs.sessions, "is_usrange_enabled")
+            disable(self.inputs.sessions, "is_tokyorange_enabled")
+
+        if not toggles.enable_swing_detection:
+            disable(self.inputs.swing_detection, "showSwing_")
+            disable(self.inputs.swing_detection, "display_third")
+
+        if not toggles.enable_zigzag:
+            disable(self.inputs.zigzag, "show_ext")
+            disable(self.inputs.zigzag, "show_labels")
+
+        if not toggles.enable_support_resistance:
+            disable(self.inputs.support_resistance, "timeframe1Enabled")
+            disable(self.inputs.support_resistance, "timeframe2Enabled")
+            disable(self.inputs.support_resistance, "timeframe3Enabled")
+            disable(self.inputs.support_resistance, "enableZones")
+            disable(self.inputs.support_resistance, "showBreaks")
+            disable(self.inputs.support_resistance, "showRetests")
+            disable(self.inputs.support_resistance, "enableRetestAlerts")
+            disable(self.inputs.support_resistance, "enableBreakAlerts")
 
     # ------------------------------------------------------------------
     # Pine primitive wrappers
@@ -6496,6 +6637,8 @@ class SmartMoneyAlgoProE5:
         return lstBx_
 
     def drawStructure(self, name: str, trend: bool) -> Tuple[float, Optional[Box]]:
+        if not self._logic_enabled("enable_market_structure"):
+            return self.lstHlPrs, None
         x, y = self.getDirection(trend, self.lastHBar, self.lastLBar, self.lastH, self.lastL)
         lstBx_: Optional[Box] = None
         if trend:
@@ -6833,6 +6976,8 @@ class SmartMoneyAlgoProE5:
 
     # ------------------------------------------------------------------
     def processZones(self, zones: PineArray, isSupply: bool, zonesmit: PineArray) -> bool:
+        if not self._logic_enabled("enable_order_block"):
+            return False
         isAlertextidm = False
         if zones.size() == 0:
             return False
@@ -6933,11 +7078,16 @@ class SmartMoneyAlgoProE5:
         if math.isnan(self.htfL) or close < self.htfL:
             self.htfL = close
 
-        self._update_daily_levels(high, low, time_val)
-        self._update_ict_market_structure(high, low, close)
-        self._update_key_levels(open_, high, low)
-        self._update_support_resistance(open_, high, low, close, volume)
-        self._update_sessions(open_, high, low, time_val)
+        if self._logic_enabled("enable_structure_util"):
+            self._update_daily_levels(high, low, time_val)
+        if self._logic_enabled("enable_ict_structure"):
+            self._update_ict_market_structure(high, low, close)
+        if self._logic_enabled("enable_key_levels"):
+            self._update_key_levels(open_, high, low)
+        if self._logic_enabled("enable_support_resistance"):
+            self._update_support_resistance(open_, high, low, close, volume)
+        if self._logic_enabled("enable_sessions"):
+            self._update_sessions(open_, high, low, time_val)
         self._trace("update_bar", "post_core", timestamp=time_val)
 
         if self.inputs.order_block.extndBox:
@@ -7330,69 +7480,76 @@ class SmartMoneyAlgoProE5:
             self.lastLBar = time_val
 
         # Order flow updates -------------------------------------------------
-        self._update_demand_supply_zones()
-        self._update_fvg()
-        self._update_liquidity()
-        self._update_swing_detection()
-        self._update_candlestick_patterns()
+        if self._logic_enabled("enable_demand_supply"):
+            self._update_demand_supply_zones()
+        if self._logic_enabled("enable_fvg"):
+            self._update_fvg()
+        if self._logic_enabled("enable_liquidity"):
+            self._update_liquidity()
+        if self._logic_enabled("enable_swing_detection"):
+            self._update_swing_detection()
+        if self._logic_enabled("enable_candle_patterns"):
+            self._update_candlestick_patterns()
         self.prev_close = close
 
-        alertBullOfMajor, alertBearOfMajor = self.getProcess(
-            self.arrOBBullm, self.arrOBBearm, self.arrOBBullisVm, self.arrOBBearisVm
-        )
-        alertBullOfMinor, alertBearOfMinor = self.getProcess(
-            self.arrOBBulls, self.arrOBBears, self.arrOBBullisVs, self.arrOBBearisVs
-        )
-        self.alertcondition(alertBullOfMajor, "Major Bullish order flow", "Major Bullish order flow")
-        self.alertcondition(alertBearOfMajor, "Major Bearish order flow", "Major Bearish order flow")
-        self.alertcondition(alertBullOfMinor, "Minor Bullish order flow", "Minor Bullish order flow")
-        self.alertcondition(alertBearOfMinor, "Minor Bearish order flow", "Minor Bearish order flow")
+        if self._logic_enabled("enable_order_flow"):
+            alertBullOfMajor, alertBearOfMajor = self.getProcess(
+                self.arrOBBullm, self.arrOBBearm, self.arrOBBullisVm, self.arrOBBearisVm
+            )
+            alertBullOfMinor, alertBearOfMinor = self.getProcess(
+                self.arrOBBulls, self.arrOBBears, self.arrOBBullisVs, self.arrOBBearisVs
+            )
+            self.alertcondition(alertBullOfMajor, "Major Bullish order flow", "Major Bullish order flow")
+            self.alertcondition(alertBearOfMajor, "Major Bearish order flow", "Major Bearish order flow")
+            self.alertcondition(alertBullOfMinor, "Minor Bullish order flow", "Minor Bullish order flow")
+            self.alertcondition(alertBearOfMinor, "Minor Bearish order flow", "Minor Bearish order flow")
 
         # Order block zone processing ---------------------------------------
-        isAlertextidmSell = self.processZones(self.supplyZone, True, self.supplyZoneIsMit)
-        isAlertextidmBuy = self.processZones(self.demandZone, False, self.demandZoneIsMit)
-        self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
-        self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
+        if self._logic_enabled("enable_order_block"):
+            isAlertextidmSell = self.processZones(self.supplyZone, True, self.supplyZoneIsMit)
+            isAlertextidmBuy = self.processZones(self.demandZone, False, self.demandZoneIsMit)
+            self.alertcondition(isAlertextidmSell, "IDM EXT Alert Supply", "IDM EXT Alert Supply")
+            self.alertcondition(isAlertextidmBuy, "IDM EXT Alert Demand", "IDM EXT Alert Demand")
 
-        # POI sweeps ---------------------------------------------------------
-        if self.inputs.order_block.showPOI and self.series.length() > 4:
-            if not self.isSweepOBS:
-                self.high_MOBS = self.series.get("high", 3)
-                self.low_MOBS = self.series.get("low", 3)
-                self.current_OBS = self.series.get_time(3)
-                if (
-                    not math.isnan(self.high_MOBS)
-                    and not math.isnan(self.series.get("high", 4))
-                    and not math.isnan(self.series.get("high", 2))
-                    and self.high_MOBS > self.series.get("high", 4)
-                    and self.high_MOBS > self.series.get("high", 2)
-                ):
-                    self.isSweepOBS = True
-            else:
-                if not math.isnan(self.low_MOBS) and self.low_MOBS > self.series.get("high", 1):
-                    if self.current_OBS is not None and not math.isnan(self.high_MOBS) and not math.isnan(self.low_MOBS):
-                        self.handleZone(
-                            self.supplyZone,
-                            self.supplyZoneIsMit,
-                            self.current_OBS,
-                            self.high_MOBS,
-                            self.low_MOBS,
-                            self.inputs.order_block.colorSupply,
-                            False,
-                        )
-                    self.isSweepOBS = False
+            # POI sweeps ---------------------------------------------------------
+            if self.inputs.order_block.showPOI and self.series.length() > 4:
+                if not self.isSweepOBS:
+                    self.high_MOBS = self.series.get("high", 3)
+                    self.low_MOBS = self.series.get("low", 3)
+                    self.current_OBS = self.series.get_time(3)
+                    if (
+                        not math.isnan(self.high_MOBS)
+                        and not math.isnan(self.series.get("high", 4))
+                        and not math.isnan(self.series.get("high", 2))
+                        and self.high_MOBS > self.series.get("high", 4)
+                        and self.high_MOBS > self.series.get("high", 2)
+                    ):
+                        self.isSweepOBS = True
                 else:
-                    if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
-                        mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
-                        mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
-                        mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
-                        self.high_MOBS = max(self.high_MOBS or -math.inf, mother_high)
-                        self.low_MOBS = min(self.low_MOBS or math.inf, mother_low)
-                        self.current_OBS = min(self.current_OBS or time_val, mother_bar)
+                    if not math.isnan(self.low_MOBS) and self.low_MOBS > self.series.get("high", 1):
+                        if self.current_OBS is not None and not math.isnan(self.high_MOBS) and not math.isnan(self.low_MOBS):
+                            self.handleZone(
+                                self.supplyZone,
+                                self.supplyZoneIsMit,
+                                self.current_OBS,
+                                self.high_MOBS,
+                                self.low_MOBS,
+                                self.inputs.order_block.colorSupply,
+                                False,
+                            )
+                        self.isSweepOBS = False
                     else:
-                        self.high_MOBS = self.series.get("high", 2)
-                        self.low_MOBS = self.series.get("low", 2)
-                        self.current_OBS = self.series.get_time(2)
+                        if self.inputs.order_block.poi_type == "Mother Bar" and self.series.length() > 2:
+                            mother_high = self._history_get(self.motherHigh_history, 2, self.motherHigh)
+                            mother_low = self._history_get(self.motherLow_history, 2, self.motherLow)
+                            mother_bar = self._history_get(self.motherBar_history, 2, self.motherBar)
+                            self.high_MOBS = max(self.high_MOBS or -math.inf, mother_high)
+                            self.low_MOBS = min(self.low_MOBS or math.inf, mother_low)
+                            self.current_OBS = min(self.current_OBS or time_val, mother_bar)
+                        else:
+                            self.high_MOBS = self.series.get("high", 2)
+                            self.low_MOBS = self.series.get("low", 2)
+                            self.current_OBS = self.series.get_time(2)
 
             if not self.isSweepOBD:
                 self.low_MOBD = self.series.get("low", 3)
@@ -7433,12 +7590,15 @@ class SmartMoneyAlgoProE5:
                         self.current_OBD = self.series.get_time(2)
 
         # SCOB and candle colouring -----------------------------------------
-        scob_supply = self.scob(self.supplyZone, True)
-        scob_demand = self.scob(self.demandZone, False)
-        if scob_supply:
-            self.bar_colors.append((time_val, scob_supply))
-        if scob_demand:
-            self.bar_colors.append((time_val, scob_demand))
+        scob_supply: Optional[str] = None
+        scob_demand: Optional[str] = None
+        if self._logic_enabled("enable_order_block"):
+            scob_supply = self.scob(self.supplyZone, True)
+            scob_demand = self.scob(self.demandZone, False)
+            if scob_supply:
+                self.bar_colors.append((time_val, scob_supply))
+            if scob_demand:
+                self.bar_colors.append((time_val, scob_demand))
         if self.inputs.candle.showISB and isb:
             self.bar_colors.append((time_val, self.inputs.candle.colorISB))
         if self.inputs.candle.showOSB and osb:
